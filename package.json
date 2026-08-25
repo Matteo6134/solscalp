@@ -1,0 +1,32 @@
+{
+  "name": "solscalp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Solana DEX safety gate + paper-trading engine. Safety-first: no private key until paper beats the monkey baseline.",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "check": "node scripts/check-token.js",
+    "scan": "node scripts/scan.js",
+    "record": "node scripts/record.js",
+    "paper": "node scripts/paper.js",
+    "backtest:rug": "node scripts/backtest-rug-filter.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dash": "node scripts/dash.js",
+    "bot": "node scripts/bot.js"
+  },
+  "dependencies": {
+    "@solana/spl-token": "0.4.15",
+    "@solana/web3.js": "1.98.4",
+    "dotenv": "^17.3.1",
+    "p-limit": "^7.3.1",
+    "undici": "^8.10.0"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^4.1.11",
+    "vitest": "^4.1.11"
+  }
+}

@@ -1,0 +1,16 @@
+node_modules/
+.env
+.env.*
+!.env.example
+data/recordings/*.jsonl
+data/*.db
+data/*.db-journal
+logs/
+*.log
+.DS_Store
+# never commit a keypair, ever
+*.keypair.json
+id.json
+wallet*.json
+coverage/
+.vitest-cache/
