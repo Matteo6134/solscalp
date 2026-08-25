@@ -256,3 +256,70 @@ describe('createNotifier -- payload and stats', () => {
     expect(httpRequest.mock.calls[0][0]).toContain('/setMyCommands');
   });
 });
+
+describe('createNotifier -- another process owns the token', () => {
+  /**
+   * Telegram permits exactly ONE getUpdates consumer per bot token. Reusing a
+   * token that another running bot already polls makes the two endlessly
+   * terminate each other -- and, worse, breaks the OTHER bot. Retrying cannot
+   * fix it, so the notifier flags it once and the caller falls back to
+   * send-only. Outbound alerts are unaffected.
+   */
+  const conflict = () =>
+    vi.fn(async () => ({
+      statusCode: 409,
+      body: {
+        text: async () =>
+          JSON.stringify({
+            ok: false,
+            description:
+              'Conflict: terminated by other getUpdates request; make sure that only one bot instance is running',
+          }),
+      },
+    }));
+
+  it('flags a 409 as commands-unavailable rather than a transient failure', async () => {
+    const { notifier } = build({}, { httpRequest: conflict() });
+
+    expect(notifier.commandsUnavailable()).toBe(false);
+    await notifier.getUpdates(0);
+    expect(notifier.commandsUnavailable()).toBe(true);
+    expect(notifier.stats().updatesConflicted).toBe(true);
+  });
+
+  it('logs the explanation only ONCE, not on every poll', async () => {
+    const { notifier, logs } = build({}, { httpRequest: conflict() });
+
+    await notifier.getUpdates(0);
+    await notifier.getUpdates(0);
+    await notifier.getUpdates(0);
+
+    const explained = logs.filter((l) => /already polling this bot token/.test(l));
+    expect(explained).toHaveLength(1);
+    expect(explained[0]).toMatch(/alerts still work/);
+  });
+
+  it('still returns an empty list so a caller loop never breaks', async () => {
+    const { notifier } = build({}, { httpRequest: conflict() });
+
+    expect(await notifier.getUpdates(0)).toEqual([]);
+  });
+
+  it('a 409 does NOT disable sending -- alerts do not conflict', async () => {
+    const httpRequest = vi
+      .fn()
+      .mockImplementationOnce(async () => ({
+        statusCode: 409,
+        body: { text: async () => JSON.stringify({ ok: false, description: 'Conflict' }) },
+      }))
+      .mockImplementation(async () => ({
+        statusCode: 200,
+        body: { text: async () => JSON.stringify({ ok: true, result: {} }) },
+      }));
+    const { notifier } = build({}, { httpRequest });
+
+    await notifier.getUpdates(0);
+    expect(notifier.commandsUnavailable()).toBe(true);
+    expect((await notifier.send('alert still works', { force: true })).status).toBe(SEND_RESULT.SENT);
+  });
+});

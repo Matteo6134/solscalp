@@ -141,6 +141,8 @@ export function createNotifier({ botToken, chatId, enabled, log = () => {}, now 
   let sent = 0;
   let failed = 0;
   let throttled = 0;
+  /** Set when another process owns this token’s getUpdates stream (HTTP 409). */
+  let updatesConflicted = false;
 
   /**
    * Send a message. NEVER throws.
@@ -218,6 +220,23 @@ export function createNotifier({ botToken, chatId, enabled, log = () => {}, now 
       deps,
     );
     if (!res.ok) {
+      // HTTP 409 means ANOTHER process is already long-polling this same bot
+      // token. Telegram permits exactly one getUpdates consumer per token, so
+      // two instances endlessly terminate each other. This is a configuration
+      // fact, not a transient failure: retrying cannot fix it, and logging it
+      // every poll would bury everything else. Flag it once and let the caller
+      // fall back to send-only -- outbound alerts do NOT conflict.
+      if (/\b409\b|conflict/i.test(String(res.detail))) {
+        if (!updatesConflicted) {
+          updatesConflicted = true;
+          log(
+            'telegram: another process is already polling this bot token (HTTP 409). ' +
+              'Commands are disabled; alerts still work. Use a separate bot from ' +
+              '@BotFather if you want the command menu here too.',
+          );
+        }
+        return Object.freeze([]);
+      }
       log(`telegram: getUpdates failed: ${res.detail}`);
       return Object.freeze([]);
     }
@@ -237,6 +256,8 @@ export function createNotifier({ botToken, chatId, enabled, log = () => {}, now 
     setCommands,
     getUpdates,
     whoAmI,
-    stats: () => Object.freeze({ enabled: active, sent, failed, throttled }),
+    stats: () => Object.freeze({ enabled: active, sent, failed, throttled, updatesConflicted }),
+    /** True once a 409 proved another process owns the command stream. */
+    commandsUnavailable: () => updatesConflicted,
   });
 }

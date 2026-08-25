@@ -65,6 +65,9 @@ Sends alerts to Telegram and answers commands from it. Long-running.
   --feed F      trending (default) | top | new
   --early       use UNIVERSE_PROFILES.early (smaller caps, younger pairs)
   --paper       also run the paper engine, so open/close alerts fire
+  --no-commands send alerts only, do not poll for commands. Use this when the
+                token is shared with another running bot (Telegram allows only
+                ONE getUpdates consumer per token; alerts do not conflict)
   --test        send one test message, confirm credentials, and exit
 
 Requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env. Both, or alerts are
@@ -177,7 +180,18 @@ export async function main(argv, injected = {}) {
   // Commands are polled in parallel with the trading cycle: a 30s long-poll must
   // not delay a cycle, and a slow cycle must not make the phone unresponsive.
   const commandLoop = (async () => {
+    if (flags['no-commands'] === true) {
+      out('command menu disabled (--no-commands): alerts only');
+      return;
+    }
     while (running) {
+      // Another process polling the same token makes commands impossible here.
+      // Outbound alerts are unaffected, so degrade to send-only rather than
+      // spinning on a conflict that retrying cannot resolve.
+      if (notifier.commandsUnavailable?.()) {
+        out('command menu unavailable on this token; continuing with alerts only');
+        return;
+      }
       const updates = await notifier.getUpdates(state.updateOffset);
       for (const update of updates) {
         state.updateOffset = Math.max(state.updateOffset, (update.update_id ?? 0) + 1);
