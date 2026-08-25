@@ -186,18 +186,69 @@ export function rpcError(message, details = {}) {
 }
 
 /**
- * One-line description of an unknown throwable, safe to embed in a message.
- * @param {unknown} err
+ * Replace every http(s) URL in `text` with its redacted form.
+ *
+ * Lives here rather than in rpc-validate.js so that describeError can use it
+ * without a circular import -- rpc-validate imports from this module.
+ * @param {unknown} text
  * @returns {string}
  */
+export function redactUrlsIn(text) {
+  return String(text).replace(/https?:\/\/[^\s"'`<>,;)\]}]+/gi, (match) => redactRpcUrl(match));
+}
+
+/**
+ * One-line description of an unknown throwable, safe to embed in a message.
+ *
+ * REDACTS EVERY URL IT TOUCHES, INCLUDING THOSE IN THE CAUSE CHAIN.
+ *   This used to redact nothing. Our own messages were built with
+ *   redactRpcUrl(), but describeError walks `err.cause`, and an upstream
+ *   undici/web3.js error embeds the full request URL -- api-key and all. An
+ *   audit traced a live path: src/rpc/mint.js interpolates describeError(err)
+ *   into a THROWN message, which becomes a layer-0 `errored()` reason, which
+ *   flows into the gate result, which scripts/record.js appends to the JSONL
+ *   dataset and scripts/bot.js sends to Telegram. A provider key could therefore
+ *   end up in durable storage and in an outbound message.
+ *
+ *   Redaction now happens HERE, so it is automatic rather than something each of
+ *   eleven call sites has to remember. Only one of them was doing it.
+ *
+ * @param {unknown} err
+ * @returns {string} safe to log, store, or send
+ */
 export function describeError(err) {
+  return redactUrlsIn(describeErrorRaw(err)).slice(0, 500);
+}
+
+/**
+ * The unredacted walk. Private: nothing outside this module should use it.
+ *
+ * DEPTH- AND CYCLE-BOUNDED. This recursed freely on `err.cause` until an audit
+ * pointed a self-referential cause at it and blew the stack. That matters more
+ * than it sounds: this function runs inside catch blocks in the safety layers,
+ * so a RangeError here escapes the very handler meant to turn a failure into an
+ * `errored()` verdict -- converting a handled error into an unhandled crash, in
+ * exactly the code path that exists to keep the gate fail-closed.
+ *
+ * `causeChain` above already had both guards; they simply were not applied here.
+ * @param {unknown} err
+ * @param {number} depth
+ * @param {Set<object>} seen
+ */
+function describeErrorRaw(err, depth = 0, seen = new Set()) {
   if (err == null) return 'unknown error';
   if (typeof err === 'string') return err;
+  if (depth >= MAX_CAUSE_DEPTH) return '<cause chain too deep>';
+  if (typeof err === 'object') {
+    if (seen.has(err)) return '<circular cause>';
+    seen.add(err);
+  }
   const name = String(err.name || 'Error');
   const message = String(err.message || err);
   const head = message.length > 0 && message !== name ? name + ': ' + message : name;
-  const inner = err.cause != null ? ' (cause: ' + describeError(err.cause) + ')' : '';
-  return (head + inner).slice(0, 500);
+  const inner =
+    err.cause != null ? ' (cause: ' + describeErrorRaw(err.cause, depth + 1, seen) + ')' : '';
+  return head + inner;
 }
 
 /**

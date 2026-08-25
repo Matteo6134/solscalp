@@ -18,7 +18,7 @@
  *    but it may not be absent.
  */
 
-import { RPC_ERROR, describeError, redactRpcUrl, rpcError } from './rpc-errors.js';
+import { RPC_ERROR, describeError, redactRpcUrl, redactUrlsIn as redactUrls, rpcError } from './rpc-errors.js';
 
 /** base58 alphabet: no 0, O, I or l. */
 const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]+$/;
@@ -66,9 +66,7 @@ export function describeValue(value) {
  * @param {unknown} text
  * @returns {string}
  */
-export function redactUrlsIn(text) {
-  return String(text).replace(/https?:\/\/[^\s"'`<>,;)\]}]+/gi, (match) => redactRpcUrl(match));
-}
+export const redactUrlsIn = redactUrls;
 
 /**
  * One-line, length-capped, credential-free description of any throwable.
