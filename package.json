@@ -16,7 +16,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "dash": "node scripts/dash.js",
-    "bot": "node scripts/bot.js"
+    "bot": "node scripts/bot.js",
+    "label": "node scripts/label.js"
   },
   "dependencies": {
     "@solana/spl-token": "0.4.15",

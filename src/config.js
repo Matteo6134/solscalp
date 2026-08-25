@@ -374,3 +374,45 @@ export const NOTIFY = Object.freeze({
   /** Long-poll timeout for the command menu. Telegram allows up to 50s. */
   pollSeconds: 30,
 });
+
+/**
+ * Outcome labelling -- what turns a recording into evidence.
+ *
+ * scripts/record.js writes every candidate with `outcome: null`. Without a
+ * labelling pass the dataset can never be scored, and the one number this whole
+ * project exists to produce -- of the tokens the filter approved, what fraction
+ * rugged -- has no input. These thresholds define "rugged" OPERATIONALLY.
+ *
+ * THE DEFINITION HAS TO BE MECHANICAL, NOT INTERPRETIVE.
+ *   "The dev rugged" is a story. "Liquidity fell by 80% or below $1k" is a
+ *   measurement, and two people running it get the same answer. So the label is
+ *   derived from liquidity and price only, and the RAW FIGURES ARE STORED
+ *   ALONGSIDE IT -- if these thresholds turn out wrong, the dataset can be
+ *   relabelled from the recorded evidence without re-collecting anything. That
+ *   is the whole reason the numbers live here instead of inside the labeller.
+ *
+ * The $1k floor is not arbitrary: it is the figure Solidus Labs used when they
+ * found 98.6% of 7M+ pump.fun tokens fell below it, so labelling against the
+ * same line makes our rate directly comparable to that base rate.
+ */
+export const LABELS = Object.freeze({
+  /**
+   * Do not judge a token before this much time has passed. Label too early and
+   * every survivor looks alive; the failure mode is a flattering dataset.
+   */
+  minAgeHoursBeforeLabelling: 24,
+  /** Liquidity at or below this is a dead pool, whatever it started at. */
+  ruggedBelowLiquidityUsd: 1_000,
+  /** Or a collapse this large from what was recorded, even if still above the floor. */
+  ruggedLiquidityDropPct: 80,
+  /** A price collapse this deep counts too: the pool can persist while the token dies. */
+  ruggedPriceDropPct: 90,
+  /**
+   * Re-label a mint at most this often. Labels are appended, never overwritten
+   * (the recording is append-only), so without this the file would grow a new
+   * label line on every run.
+   */
+  relabelAfterHours: 24,
+  /** Line type used for appended label records, so readers can tell them apart. */
+  recordType: 'labels',
+});

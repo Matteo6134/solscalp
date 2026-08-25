@@ -263,6 +263,29 @@ describe('decideEntry -- universe filters, each in isolation', () => {
     expect(why(v)).toMatch(/quote mint unknown/);
   });
 
+  it('refuses a pair whose BASE token is itself a quote asset', () => {
+    // the trending feed is full of SOL/USDC pools; WSOL is the major pair, not a
+    // candidate. These used to be discarded as "market cap unknown" instead.
+    const v = entry({ mint: KNOWN.WSOL, baseToken: { address: KNOWN.WSOL, symbol: 'SOL' } });
+
+    expect(v.enter).toBe(false);
+    expect(why(v)).toMatch(/is itself a quote asset, not a trade candidate/);
+  });
+
+  it('refuses a USDC-based pair for the same reason', () => {
+    const v = entry({
+      mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+      baseToken: { address: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', symbol: 'USDC' },
+    });
+
+    expect(v.enter).toBe(false);
+    expect(why(v)).toMatch(/itself a quote asset/);
+  });
+
+  it('still accepts an ordinary token quoted in SOL', () => {
+    expect(entry().enter).toBe(true);
+  });
+
   it('keeps the quote-mint rule even when a profile override is supplied', () => {
     // quoteMints is a safety choice, so a profile must not be able to widen it
     const v = entry(

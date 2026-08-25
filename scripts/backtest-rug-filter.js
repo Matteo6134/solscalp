@@ -23,7 +23,7 @@
 
 import { readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import { RECORDER } from '../src/config.js';
+import { LABELS, RECORDER } from '../src/config.js';
 import { EXIT, isMain, line, parseArgs, runMain } from './lib/cli.js';
 
 /**
@@ -147,6 +147,8 @@ export function scoreRugFilter({
  */
 export function tallyRecords(lines) {
   const seen = new Map();
+  /** mint -> outcome, from the label records scripts/label.js appends. */
+  const appendedLabels = new Map();
   let malformed = 0;
   // Counted from records actually parsed, NOT from lines.length: splitting a
   // trailing-newline file yields an empty final element, which would inflate the
@@ -168,6 +170,20 @@ export function tallyRecords(lines) {
       malformed += 1;
       continue;
     }
+
+    // Label records are appended by the labeller rather than editing the
+    // snapshots in place, so the raw observations stay exactly as taken.
+    if (record.type === LABELS.recordType) {
+      for (const entry of record.labels ?? []) {
+        if (typeof entry?.mint !== 'string') continue;
+        const prior = appendedLabels.get(entry.mint);
+        if (prior === undefined || (entry.ts ?? 0) >= (prior.ts ?? 0)) {
+          appendedLabels.set(entry.mint, entry);
+        }
+      }
+      continue;
+    }
+
     snapshots += 1;
     for (const candidate of record.candidates ?? []) {
       if (typeof candidate?.mint !== 'string') continue;
@@ -175,15 +191,23 @@ export function tallyRecords(lines) {
       // actually have traded on. Later snapshots are the same token, re-observed.
       if (!seen.has(candidate.mint)) seen.set(candidate.mint, candidate);
       else if (candidate.outcome !== null && seen.get(candidate.mint).outcome === null) {
-        // ...but a later label is still a label for that first decision.
+        // ...but a later inline label is still a label for that first decision.
         seen.set(candidate.mint, { ...seen.get(candidate.mint), outcome: candidate.outcome });
       }
     }
   }
 
-  const all = [...seen.values()];
+  // Merge appended labels onto the first observation of each mint.
+  const all = [...seen.values()].map((c) => {
+    const appended = appendedLabels.get(c.mint);
+    return appended === undefined ? c : { ...c, outcome: c.outcome ?? appended.outcome };
+  });
+
+  const isLabelled = (c) => c.outcome !== null && c.outcome !== undefined;
   const approvals = all.filter((c) => c.gate?.buyable === true);
-  const labelled = approvals.filter((c) => c.outcome !== null && c.outcome !== undefined);
+  const blocked = all.filter((c) => c.gate?.buyable !== true);
+  const labelled = approvals.filter(isLabelled);
+  const blockedLabelled = blocked.filter(isLabelled);
 
   return Object.freeze({
     snapshots,
@@ -192,7 +216,16 @@ export function tallyRecords(lines) {
     approved: labelled.length,
     rugged: labelled.filter((c) => c.outcome === 'rugged').length,
     unlabelled: approvals.length - labelled.length,
-    rejected: all.length - approvals.length,
+    rejected: blocked.length,
+    /**
+     * The control cohort. A filter that approves 10% ruggers has proved nothing
+     * if the tokens it BLOCKED rugged at 10% too -- that would mean it is
+     * discarding candidates without discriminating. This is the comparison that
+     * actually measures skill, and it is free because the rejects are already in
+     * the file.
+     */
+    blockedLabelled: blockedLabelled.length,
+    blockedRugged: blockedLabelled.filter((c) => c.outcome === 'rugged').length,
   });
 }
 
@@ -253,6 +286,7 @@ Refuses to report a rate on fewer than ${MIN_SAMPLE} labelled approvals.
   out(`    of those, labelled ${tally.approved}`);
   out(`    still unlabelled   ${tally.unlabelled}  <- counted as UNKNOWN, not as survived`);
   out(`  gate blocked        ${tally.rejected}`);
+  out(`    of those, labelled ${tally.blockedLabelled}   rugged ${tally.blockedRugged}`);
   out('');
 
   if (!report.sufficient) {
@@ -271,6 +305,34 @@ Refuses to report a rate on fewer than ${MIN_SAMPLE} labelled approvals.
   out('');
   out(`  Read as: of ${report.approved} tokens this filter approved, ${report.rugged} later rugged.`);
   out('  The interval is what matters, not the point estimate.');
+
+  // The control cohort. Beating the population base rate is not enough on its
+  // own: if the tokens the gate BLOCKED rugged at the same rate as the ones it
+  // approved, the gate is discarding candidates without discriminating between
+  // them, and the lift above is just the population it happened to sample from.
+  if (tally.blockedLabelled >= MIN_SAMPLE) {
+    const blockedPct = (tally.blockedRugged / tally.blockedLabelled) * 100;
+    const gap = blockedPct - report.ruggedPct;
+    out('');
+    out(line('-'));
+    out('  CONTROL COHORT -- the tokens the gate REJECTED');
+    out(`  rejected-and-rugged  ${tally.blockedRugged}/${tally.blockedLabelled} = ${blockedPct.toFixed(1)}%`);
+    out(`  approved-and-rugged  ${report.rugged}/${report.approved} = ${report.ruggedPct.toFixed(1)}%`);
+    out(`  separation           ${gap.toFixed(1)} percentage points`);
+    out('');
+    if (gap <= 0) {
+      out('  THE GATE IS NOT DISCRIMINATING. What it blocked rugged no more often');
+      out('  than what it approved, so the filter is not distinguishing between them.');
+      out('  That is the finding, and it matters more than the rate above.');
+    } else {
+      out('  The gate blocked a dirtier cohort than it approved, which is what a');
+      out('  working filter looks like. Sample size still governs how much to believe.');
+    }
+  } else {
+    out('');
+    out(`  (No control comparison: only ${tally.blockedLabelled} labelled rejects, ${MIN_SAMPLE} needed.`);
+    out('   Beating the base rate alone cannot show the gate discriminates.)');
+  }
   out(line('-'));
   return EXIT.OK;
 }

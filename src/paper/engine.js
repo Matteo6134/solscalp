@@ -402,6 +402,22 @@ export function universeReasons(pair, now, universe, precomputed) {
     reasons.push(`quote mint ${signals.quoteMint} is not in the permitted set`);
   }
 
+  // The token being traded must not itself be one of the quote assets. The
+  // trending feed is full of SOL/USDC pools, whose BASE mint is WSOL -- that is
+  // the major pair, not a candidate to buy. They used to reach the screen and be
+  // discarded as "market cap unknown", which is fail-closed working but for
+  // entirely the wrong reason: Dexscreener reports no market cap for SOL because
+  // the question is meaningless, not because the data is missing. Measured on one
+  // trending page: 8 of 20 pools were SOL/USDC.
+  //
+  // Derived from quoteMints rather than a second list, so the two can never drift.
+  if (typeof pair.mint === 'string' && uni.quoteMints.includes(pair.mint)) {
+    reasons.push(
+      `${pair.mint} is itself a quote asset, not a trade candidate ` +
+        '(this is the major pair, e.g. SOL/USDC)',
+    );
+  }
+
   return Object.freeze(reasons);
 }
 
