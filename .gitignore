@@ -14,3 +14,4 @@ id.json
 wallet*.json
 coverage/
 .vitest-cache/
+data/*.html
