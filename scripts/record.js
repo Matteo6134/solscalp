@@ -32,7 +32,7 @@ import { getTrendingPools } from '../src/data/geckoterminal.js';
 import { loadEnv } from '../src/env.js';
 import { readSignals, universeReasons } from '../src/paper/engine.js';
 import { runGate } from '../src/safety/index.js';
-import { EXIT, buildRpc, intFlag, isMain, parseArgs, runMain } from './lib/cli.js';
+import { EXIT, buildRpc, intFlag, isMain, parseArgs, runMain, say } from './lib/cli.js';
 
 const GATE_CONCURRENCY = 3;
 const MS_PER_SECOND = 1_000;
@@ -118,7 +118,7 @@ async function collect({ universe, rpc, now, fetchPools, fetchPairs, gate, concu
  */
 export async function main(argv, deps = {}) {
   const { flags } = parseArgs(argv);
-  const out = deps.out ?? console.log;
+  const out = deps.out ?? say;
   if (flags.help === true) {
     out(USAGE);
     return EXIT.OK;

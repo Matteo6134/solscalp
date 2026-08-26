@@ -51,7 +51,7 @@ import {
 } from '../src/paper/engine.js';
 import { emptyPortfolio, portfolioEquityUsd } from '../src/paper/portfolio.js';
 import { recheckGate, runGate } from '../src/safety/index.js';
-import { EXIT, buildRpc, intFlag, isMain, parseArgs, runMain } from './lib/cli.js';
+import { EXIT, buildRpc, intFlag, isMain, parseArgs, runMain, say } from './lib/cli.js';
 import { costsFor, solPriceFrom } from './lib/liveCosts.js';
 
 const GATE_CONCURRENCY = 3;
@@ -90,7 +90,7 @@ function parseCommand(text) {
  */
 export async function main(argv, injected = {}) {
   const { flags } = parseArgs(argv);
-  const out = injected.out ?? console.log;
+  const out = injected.out ?? say;
   if (flags.help === true) {
     out(USAGE);
     return EXIT.OK;

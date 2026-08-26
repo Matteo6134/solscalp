@@ -15,3 +15,7 @@ wallet*.json
 coverage/
 .vitest-cache/
 data/*.html
+data/*.out
+data/*.err
+data/probe.txt
+data/manual.*

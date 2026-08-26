@@ -12,6 +12,10 @@
  * proven is the failure mode this whole project is built to avoid.
  */
 
+import { appendFileSync, writeSync } from 'node:fs';
+import { platform } from 'node:os';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { OUTCOME } from '../../src/safety/verdict.js';
 
 /** Process exit codes, shared by every script so shell pipelines compose. */
@@ -138,6 +142,45 @@ export function printGateReport(gate, out = console.log) {
 const dedupe = (list) => [...new Set(list)];
 
 /**
+ * Write one line to stdout, UNBUFFERED.
+ *
+ * `console.log` buffers when stdout is a pipe rather than a terminal, which is
+ * exactly the case under pm2 or any process manager. A long-running recorder
+ * would then produce an EMPTY log file while working perfectly, and the operator
+ * cannot tell that from a dead process -- which is precisely the confusion that
+ * cost an afternoon here, with a recorder that had silently stopped hours
+ * earlier. A process whose whole job is to not miss anything must be observable
+ * while it runs, so the few microseconds a synchronous write costs are worth it.
+ *
+ * Falls back to console.log if fd 1 is not writable (a rare harness case).
+ * @param {string} text
+ */
+export function say(text) {
+  const line_ = `${text}\n`;
+  try {
+    writeSync(1, line_);
+  } catch {
+    // eslint-disable-next-line no-console
+    console.log(text);
+  }
+  // A second, independent sink. pm2 on this machine reports a process "online"
+  // while capturing nothing at all -- both its .log and .err stayed at zero bytes
+  // through a working run -- so an operator inspecting pm2's logs cannot tell a
+  // healthy daemon from a dead one. For a recorder whose entire job is to not
+  // miss anything, and whose data cannot be re-collected afterwards, that is not
+  // an acceptable blind spot. Writing our own file means observability does not
+  // depend on the process manager behaving.
+  const sink = process.env.SOLSCALP_LOG_FILE;
+  if (typeof sink === 'string' && sink !== '') {
+    try {
+      appendFileSync(sink, `${new Date().toISOString()} ${line_}`, 'utf8');
+    } catch {
+      /* a log sink must never be able to take down the thing it is logging */
+    }
+  }
+}
+
+/**
  * Wrap a script body: prints errors to stderr, sets the exit code, and makes
  * Ctrl+C a clean exit rather than an unhandled rejection.
  * @param {() => Promise<number>} body resolves to an EXIT code
@@ -165,11 +208,25 @@ export async function runMain(body) {
  */
 export function isMain(moduleUrl) {
   const invoked = process.argv[1];
-  if (typeof invoked !== 'string') return false;
-  // Compare resolved paths, not raw strings: argv[1] is a path, moduleUrl a URL.
+  if (typeof invoked !== 'string' || invoked === '') return false;
   try {
-    return new URL(moduleUrl).pathname.replace(/^\/([A-Za-z]:)/, '$1') ===
-      invoked.replace(/\\/g, '/');
+    // Resolve BOTH sides to a real absolute path before comparing. The previous
+    // version did string surgery on the URL and compared it to argv[1] verbatim,
+    // which broke the moment a launcher passed a lowercase drive letter --
+    // "c:/..." !== "C:/..." -- and pm2 does exactly that.
+    //
+    // The failure mode is the reason this is worth care: when the comparison is
+    // wrong, the module still imports perfectly and simply never calls main().
+    // The process sits there reporting "online" with no output, no work, and no
+    // error. A crash would have been far kinder. A recorder that silently does
+    // nothing is indistinguishable from a quiet market, and it loses evidence
+    // that cannot be re-collected.
+    const self = resolve(fileURLToPath(moduleUrl));
+    const entry = resolve(invoked);
+    // Windows paths are case-insensitive; POSIX paths are not.
+    return platform() === 'win32'
+      ? self.toLowerCase() === entry.toLowerCase()
+      : self === entry;
   } catch {
     return false;
   }

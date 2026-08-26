@@ -19,7 +19,8 @@
     "bot": "node scripts/bot.js",
     "label": "node scripts/label.js",
     "watchlist": "node scripts/watchlist.js",
-    "stop": "node scripts/stop.js"
+    "stop": "node scripts/stop.js",
+    "start": "powershell -NoProfile -ExecutionPolicy Bypass -File start.ps1"
   },
   "dependencies": {
     "@solana/spl-token": "0.4.15",
