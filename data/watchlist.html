@@ -1,0 +1,986 @@
+<title>Token Mortality Register</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+  :root{
+    --paper:#f7f8fa; --raised:#ffffff; --ink:#14181f; --ink-2:#3d4653;
+    --dim:#6e7681; --rule:#dfe3e8; --rule-soft:#eaedf1;
+    --crit:#a8332a; --warn:#b3722a; --mild:#7d7f88; --ok:#2f6b4f; --none:#a9afb8;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --paper:#0e1116; --raised:#151a21; --ink:#e6e9ed; --ink-2:#b3bac4;
+      --dim:#8b939e; --rule:#232a33; --rule-soft:#1b212a;
+      --crit:#e8837a; --warn:#d8a05e; --mild:#8d949e; --ok:#64b98a; --none:#5d646d;
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#0e1116; --raised:#151a21; --ink:#e6e9ed; --ink-2:#b3bac4;
+    --dim:#8b939e; --rule:#232a33; --rule-soft:#1b212a;
+    --crit:#e8837a; --warn:#d8a05e; --mild:#8d949e; --ok:#64b98a; --none:#5d646d;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:34px 18px 64px;background:var(--paper);color:var(--ink);
+    font-family:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
+  .sheet{max-width:1020px;margin:0 auto}
+  .eyebrow{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:11px;
+    letter-spacing:.14em;text-transform:uppercase;color:var(--dim);margin:0 0 8px}
+  h1{font-size:clamp(25px,5vw,34px);line-height:1.1;font-weight:600;margin:0 0 10px;
+    letter-spacing:-.02em;text-wrap:balance}
+  .standfirst{color:var(--ink-2);font-size:15.5px;max-width:63ch;margin:0 0 30px}
+  .standfirst b{color:var(--ink);font-weight:600}
+
+  .attrition{margin-bottom:8px}
+  .track{display:flex;height:13px;gap:2px;border-radius:2px;overflow:hidden}
+  .seg{min-width:3px;border-radius:1px}
+  .seg.crit{background:var(--crit)} .seg.warn{background:var(--warn)}
+  .seg.mild{background:var(--mild)} .seg.ok{background:var(--ok)}
+  .seg.none{background:var(--none)}
+  ul.legend{list-style:none;display:flex;flex-wrap:wrap;gap:6px 22px;
+    margin:14px 0 34px;padding:0}
+  ul.legend li{display:flex;align-items:baseline;gap:7px;font-size:13px}
+  ul.legend b{font-family:"IBM Plex Mono",ui-monospace,monospace;font-weight:600;
+    font-variant-numeric:tabular-nums}
+  ul.legend span{color:var(--ink-2)}
+  ul.legend em{color:var(--dim);font-style:normal;font-size:12px}
+  .dot{width:8px;height:8px;border-radius:50%;flex:none;transform:translateY(-1px)}
+  .dot.crit{background:var(--crit)} .dot.warn{background:var(--warn)}
+  .dot.mild{background:var(--mild)} .dot.ok{background:var(--ok)}
+  .dot.none{background:var(--none)}
+
+  .scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;
+    border:1px solid var(--rule);border-radius:4px;background:var(--raised)}
+  table{border-collapse:collapse;width:100%;min-width:660px}
+  caption{text-align:left;padding:13px 16px;font-size:11px;letter-spacing:.12em;
+    text-transform:uppercase;color:var(--dim);border-bottom:1px solid var(--rule);
+    font-family:"IBM Plex Mono",ui-monospace,monospace}
+  thead th{font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;
+    color:var(--dim);font-weight:600;text-align:left;padding:10px 12px;
+    border-bottom:1px solid var(--rule);white-space:nowrap;background:var(--raised)}
+  thead th.n{text-align:right}
+  tbody th{font-weight:400;text-align:left;padding:0 12px 0 0;position:relative}
+  tbody td,tbody th{border-bottom:1px solid var(--rule-soft);white-space:nowrap;
+    padding-top:9px;padding-bottom:9px}
+  tbody tr:last-child td,tbody tr:last-child th{border-bottom:0}
+  .stripe{position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--none)}
+  tr.crit .stripe{background:var(--crit)} tr.warn .stripe{background:var(--warn)}
+  tr.mild .stripe{background:var(--mild)} tr.ok .stripe{background:var(--ok)}
+  .sym{display:inline-block;margin-left:15px;font-weight:600;font-size:14px;
+    max-width:15ch;overflow:hidden;text-overflow:ellipsis;vertical-align:middle}
+  .mint{display:block;margin-left:15px;font-family:"IBM Plex Mono",ui-monospace,monospace;
+    font-size:10.5px;color:var(--dim)}
+  td.n{text-align:right;font-family:"IBM Plex Mono",ui-monospace,monospace;
+    font-size:13px;font-variant-numeric:tabular-nums;padding-left:12px;padding-right:12px}
+  td.age{color:var(--dim);font-size:12px}
+  .chg{font-weight:600}
+  tr.crit .chg{color:var(--crit)} tr.warn .chg{color:var(--warn)}
+  tr.ok .chg{color:var(--ok)} tr.none .chg{color:var(--dim)}
+  .barcell{width:96px;padding:0 12px}
+  .bar{display:block;height:5px;border-radius:1px;background:var(--mild);min-width:2px}
+  tr.crit .bar{background:var(--crit)} tr.warn .bar{background:var(--warn)}
+  tr.ok .bar{background:var(--ok)} tr.none .bar{background:transparent}
+  .gate{font-size:11.5px;color:var(--dim);font-family:"IBM Plex Mono",ui-monospace,monospace}
+
+  .footnotes{margin-top:30px;display:grid;gap:16px;
+    grid-template-columns:repeat(auto-fit,minmax(258px,1fr))}
+  .fn{border-top:2px solid var(--rule);padding-top:13px}
+  .fn h2{font-size:11px;letter-spacing:.11em;text-transform:uppercase;color:var(--dim);
+    margin:0 0 7px;font-weight:600;font-family:"IBM Plex Mono",ui-monospace,monospace}
+  .fn p{margin:0;font-size:13px;color:var(--ink-2);line-height:1.55}
+  .fn p b{color:var(--ink);font-weight:600}
+  a{color:inherit}
+  a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--ok);outline-offset:2px}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+<div class="sheet">
+  <p class="eyebrow">Solscalp · forward record · 2026-08-26 06:13 UTC</p>
+  <h1>Token Mortality Register</h1>
+  <p class="standfirst">Every token the scanner has recorded, and what became of its pool.
+  Entry figures come from the first sighting — the moment the filter would have acted.
+  <b>Current figures are fetched live, not read back from the recording</b>, because the
+  recorder only watches a token while it still passes the screen: its last stored reading
+  is the last healthy one, never the outcome.</p>
+
+  <div class="attrition"><div class="track"><div class="seg crit" style="flex:23.684210526315788" title="gone: 18"></div><div class="seg warn" style="flex:21.052631578947366" title="bleeding: 16"></div><div class="seg mild" style="flex:28.947368421052634" title="sagging: 22"></div><div class="seg ok" style="flex:14.473684210526317" title="holding: 11"></div><div class="seg none" style="flex:11.842105263157894" title="unreadable: 9"></div></div></div>
+  <ul class="legend"><li><i class="dot crit"></i><b>18</b>
+<span>gone</span><em>down 90%+</em></li>
+<li><i class="dot warn"></i><b>16</b>
+<span>bleeding</span><em>down 50–90%</em></li>
+<li><i class="dot mild"></i><b>22</b>
+<span>sagging</span><em>down 0–50%</em></li>
+<li><i class="dot ok"></i><b>11</b>
+<span>holding</span><em>flat or up</em></li>
+<li><i class="dot none"></i><b>9</b>
+<span>unreadable</span><em>no figure</em></li></ul>
+
+  <div class="scroll">
+    <table>
+      <caption>76 tokens · sorted worst first</caption>
+      <thead><tr>
+        <th scope="col">Token</th>
+        <th scope="col" class="n">Liquidity at entry</th>
+        <th scope="col" class="n">Liquidity now</th>
+        <th scope="col" class="n">Change</th>
+        <th scope="col"><span class="sr">Magnitude</span></th>
+        <th scope="col" class="n">Age</th>
+        <th scope="col" class="n">Sightings</th>
+        <th scope="col">Gate</th>
+      </tr></thead>
+      <tbody>
+<tr class="crit">
+<th scope="row"><span class="stripe"></span><span class="sym">George</span>
+<span class="mint">Cy7JHw…Fr5Z</span></th>
+<td class="n">$24,627</td>
+<td class="n">$0.0000</td>
+<td class="n chg">-100%</td>
+<td class="barcell"><span class="bar down" style="width:100%"></span></td>
+<td class="n age">7h</td>
+<td class="n age">2</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="crit">
+<th scope="row"><span class="stripe"></span><span class="sym">Pistacio</span>
+<span class="mint">J8AT1a…UbSV</span></th>
+<td class="n">$32,569</td>
+<td class="n">$0.0000</td>
+<td class="n chg">-100%</td>
+<td class="barcell"><span class="bar down" style="width:100%"></span></td>
+<td class="n age">6h</td>
+<td class="n age">3</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="crit">
+<th scope="row"><span class="stripe"></span><span class="sym">eno</span>
+<span class="mint">HGmQt2…Ccx2</span></th>
+<td class="n">$32,486</td>
+<td class="n">$0.0000</td>
+<td class="n chg">-100%</td>
+<td class="barcell"><span class="bar down" style="width:100%"></span></td>
+<td class="n age">4h</td>
+<td class="n age">2</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="crit">
+<th scope="row"><span class="stripe"></span><span class="sym">SOUL</span>
+<span class="mint">6dR2aE…kHLV</span></th>
+<td class="n">$67,455</td>
+<td class="n">$0.0000</td>
+<td class="n chg">-100%</td>
+<td class="barcell"><span class="bar down" style="width:100%"></span></td>
+<td class="n age">4h</td>
+<td class="n age">3</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="crit">
+<th scope="row"><span class="stripe"></span><span class="sym">牛来了</span>
+<span class="mint">BXZwty…XxXZ</span></th>
+<td class="n">$35,804</td>
+<td class="n">$0.0100</td>
+<td class="n chg">-100%</td>
+<td class="barcell"><span class="bar down" style="width:100%"></span></td>
+<td class="n age">4h</td>
+<td class="n age">10</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="crit">
+<th scope="row"><span class="stripe"></span><span class="sym">DRILLPIG</span>
+<span class="mint">8x1Fnj…1HGc</span></th>
+<td class="n">$28,439</td>
+<td class="n">$0.0000</td>
+<td class="n chg">-100%</td>
+<td class="barcell"><span class="bar down" style="width:100%"></span></td>
+<td class="n age">3h</td>
+<td class="n age">3</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="crit">
+<th scope="row"><span class="stripe"></span><span class="sym">Geiger</span>
+<span class="mint">HwSZ79…PiNE</span></th>
+<td class="n">$32,626</td>
+<td class="n">$0.0000</td>
+<td class="n chg">-100%</td>
+<td class="barcell"><span class="bar down" style="width:100%"></span></td>
+<td class="n age">3h</td>
+<td class="n age">6</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="crit">
+<th scope="row"><span class="stripe"></span><span class="sym">fish</span>
+<span class="mint">69GgMV…a42i</span></th>
+<td class="n">$38,222</td>
+<td class="n">$0.0000</td>
+<td class="n chg">-100%</td>
+<td class="barcell"><span class="bar down" style="width:100%"></span></td>
+<td class="n age">2h</td>
+<td class="n age">1</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="crit">
+<th scope="row"><span class="stripe"></span><span class="sym">MARTIANS</span>
+<span class="mint">ATNtDy…DWuE</span></th>
+<td class="n">$36,536</td>
+<td class="n">$0.0000</td>
+<td class="n chg">-100%</td>
+<td class="barcell"><span class="bar down" style="width:100%"></span></td>
+<td class="n age">1h</td>
+<td class="n age">23</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="crit">
+<th scope="row"><span class="stripe"></span><span class="sym">APPLECAT</span>
+<span class="mint">6ESmK8…pump</span></th>
+<td class="n">$60,099</td>
+<td class="n">$2,169</td>
+<td class="n chg">-96%</td>
+<td class="barcell"><span class="bar down" style="width:96.39%"></span></td>
+<td class="n age">14h</td>
+<td class="n age">31</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="crit">
+<th scope="row"><span class="stripe"></span><span class="sym">Otter</span>
+<span class="mint">FojFAR…pump</span></th>
+<td class="n">$47,851</td>
+<td class="n">$2,263</td>
+<td class="n chg">-95%</td>
+<td class="barcell"><span class="bar down" style="width:95.27%"></span></td>
+<td class="n age">14h</td>
+<td class="n age">7</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="crit">
+<th scope="row"><span class="stripe"></span><span class="sym">长毛</span>
+<span class="mint">9orRZb…pump</span></th>
+<td class="n">$51,377</td>
+<td class="n">$2,490</td>
+<td class="n chg">-95%</td>
+<td class="barcell"><span class="bar down" style="width:95.15%"></span></td>
+<td class="n age">14h</td>
+<td class="n age">3</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="crit">
+<th scope="row"><span class="stripe"></span><span class="sym">Catetacio</span>
+<span class="mint">CSZnMh…pump</span></th>
+<td class="n">$42,912</td>
+<td class="n">$2,109</td>
+<td class="n chg">-95%</td>
+<td class="barcell"><span class="bar down" style="width:95.09%"></span></td>
+<td class="n age">4h</td>
+<td class="n age">23</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="crit">
+<th scope="row"><span class="stripe"></span><span class="sym">TRENCHERS</span>
+<span class="mint">D9qNfY…pump</span></th>
+<td class="n">$51,250</td>
+<td class="n">$2,593</td>
+<td class="n chg">-95%</td>
+<td class="barcell"><span class="bar down" style="width:94.94%"></span></td>
+<td class="n age">15h</td>
+<td class="n age">136</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="crit">
+<th scope="row"><span class="stripe"></span><span class="sym">RATMAN</span>
+<span class="mint">DPxk9o…pump</span></th>
+<td class="n">$26,483</td>
+<td class="n">$2,027</td>
+<td class="n chg">-92%</td>
+<td class="barcell"><span class="bar down" style="width:92.35%"></span></td>
+<td class="n age">2h</td>
+<td class="n age">3</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="crit">
+<th scope="row"><span class="stripe"></span><span class="sym">MARSCAT</span>
+<span class="mint">7h3jTP…pump</span></th>
+<td class="n">$33,165</td>
+<td class="n">$2,603</td>
+<td class="n chg">-92%</td>
+<td class="barcell"><span class="bar down" style="width:92.15%"></span></td>
+<td class="n age">7h</td>
+<td class="n age">5</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="crit">
+<th scope="row"><span class="stripe"></span><span class="sym">BABYPISTACIO</span>
+<span class="mint">3oXS3f…pump</span></th>
+<td class="n">$26,603</td>
+<td class="n">$2,090</td>
+<td class="n chg">-92%</td>
+<td class="barcell"><span class="bar down" style="width:92.14%"></span></td>
+<td class="n age">4h</td>
+<td class="n age">1</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="crit">
+<th scope="row"><span class="stripe"></span><span class="sym">EWARN</span>
+<span class="mint">5g2qeJ…pump</span></th>
+<td class="n">$26,558</td>
+<td class="n">$2,303</td>
+<td class="n chg">-91%</td>
+<td class="barcell"><span class="bar down" style="width:91.33%"></span></td>
+<td class="n age">3h</td>
+<td class="n age">4</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="warn">
+<th scope="row"><span class="stripe"></span><span class="sym">RedLeek</span>
+<span class="mint">57L636…pump</span></th>
+<td class="n">$21,175</td>
+<td class="n">$2,346</td>
+<td class="n chg">-89%</td>
+<td class="barcell"><span class="bar down" style="width:88.92%"></span></td>
+<td class="n age">3h</td>
+<td class="n age">4</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="warn">
+<th scope="row"><span class="stripe"></span><span class="sym">muse</span>
+<span class="mint">Wumydo…8use</span></th>
+<td class="n">$18,908</td>
+<td class="n">$2,106</td>
+<td class="n chg">-89%</td>
+<td class="barcell"><span class="bar down" style="width:88.86%"></span></td>
+<td class="n age">5h</td>
+<td class="n age">2</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="warn">
+<th scope="row"><span class="stripe"></span><span class="sym">Grizzle</span>
+<span class="mint">2Fr5NC…pump</span></th>
+<td class="n">$24,423</td>
+<td class="n">$2,773</td>
+<td class="n chg">-89%</td>
+<td class="barcell"><span class="bar down" style="width:88.65%"></span></td>
+<td class="n age">5h</td>
+<td class="n age">4</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="warn">
+<th scope="row"><span class="stripe"></span><span class="sym">Froovik</span>
+<span class="mint">59oHqL…pump</span></th>
+<td class="n">$25,689</td>
+<td class="n">$3,333</td>
+<td class="n chg">-87%</td>
+<td class="barcell"><span class="bar down" style="width:87.03%"></span></td>
+<td class="n age">6h</td>
+<td class="n age">3</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="warn">
+<th scope="row"><span class="stripe"></span><span class="sym">/ONBOARDING</span>
+<span class="mint">9Q56Wi…pump</span></th>
+<td class="n">$47,606</td>
+<td class="n">$6,823</td>
+<td class="n chg">-86%</td>
+<td class="barcell"><span class="bar down" style="width:85.67%"></span></td>
+<td class="n age">13h</td>
+<td class="n age">29</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="warn">
+<th scope="row"><span class="stripe"></span><span class="sym">Json</span>
+<span class="mint">HnmgbH…pump</span></th>
+<td class="n">$13,840</td>
+<td class="n">$2,369</td>
+<td class="n chg">-83%</td>
+<td class="barcell"><span class="bar down" style="width:82.89%"></span></td>
+<td class="n age">5h</td>
+<td class="n age">2</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="warn">
+<th scope="row"><span class="stripe"></span><span class="sym">PEANUT</span>
+<span class="mint">HyedtH…pump</span></th>
+<td class="n">$16,119</td>
+<td class="n">$2,879</td>
+<td class="n chg">-82%</td>
+<td class="barcell"><span class="bar down" style="width:82.14%"></span></td>
+<td class="n age">5h</td>
+<td class="n age">1</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="warn">
+<th scope="row"><span class="stripe"></span><span class="sym">eˣ</span>
+<span class="mint">DUsxzG…pump</span></th>
+<td class="n">$16,163</td>
+<td class="n">$2,949</td>
+<td class="n chg">-82%</td>
+<td class="barcell"><span class="bar down" style="width:81.75%"></span></td>
+<td class="n age">2h</td>
+<td class="n age">2</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="warn">
+<th scope="row"><span class="stripe"></span><span class="sym">dih</span>
+<span class="mint">64BGDV…pump</span></th>
+<td class="n">$23,235</td>
+<td class="n">$5,827</td>
+<td class="n chg">-75%</td>
+<td class="barcell"><span class="bar down" style="width:74.92%"></span></td>
+<td class="n age">4h</td>
+<td class="n age">6</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="warn">
+<th scope="row"><span class="stripe"></span><span class="sym">Artcoin</span>
+<span class="mint">7KDuER…pump</span></th>
+<td class="n">$22,610</td>
+<td class="n">$6,926</td>
+<td class="n chg">-69%</td>
+<td class="barcell"><span class="bar down" style="width:69.37%"></span></td>
+<td class="n age">5h</td>
+<td class="n age">3</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="warn">
+<th scope="row"><span class="stripe"></span><span class="sym">PNUTS</span>
+<span class="mint">6niGCF…pump</span></th>
+<td class="n">$14,497</td>
+<td class="n">$4,563</td>
+<td class="n chg">-69%</td>
+<td class="barcell"><span class="bar down" style="width:68.52%"></span></td>
+<td class="n age">6h</td>
+<td class="n age">14</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="warn">
+<th scope="row"><span class="stripe"></span><span class="sym">WUF</span>
+<span class="mint">3YVwvY…pump</span></th>
+<td class="n">$34,545</td>
+<td class="n">$11,214</td>
+<td class="n chg">-68%</td>
+<td class="barcell"><span class="bar down" style="width:67.54%"></span></td>
+<td class="n age">1h</td>
+<td class="n age">7</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="warn">
+<th scope="row"><span class="stripe"></span><span class="sym">DOG </span>
+<span class="mint">DckYpt…pump</span></th>
+<td class="n">$10,772</td>
+<td class="n">$3,552</td>
+<td class="n chg">-67%</td>
+<td class="barcell"><span class="bar down" style="width:67.03%"></span></td>
+<td class="n age">2h</td>
+<td class="n age">1</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="warn">
+<th scope="row"><span class="stripe"></span><span class="sym">BabyP</span>
+<span class="mint">82fSfC…pump</span></th>
+<td class="n">$34,111</td>
+<td class="n">$11,287</td>
+<td class="n chg">-67%</td>
+<td class="barcell"><span class="bar down" style="width:66.91%"></span></td>
+<td class="n age">6h</td>
+<td class="n age">9</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="warn">
+<th scope="row"><span class="stripe"></span><span class="sym">Rizzdian</span>
+<span class="mint">CrJC3T…pump</span></th>
+<td class="n">$11,217</td>
+<td class="n">$4,216</td>
+<td class="n chg">-62%</td>
+<td class="barcell"><span class="bar down" style="width:62.41%"></span></td>
+<td class="n age">3h</td>
+<td class="n age">8</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="warn">
+<th scope="row"><span class="stripe"></span><span class="sym">PROXY</span>
+<span class="mint">ZqXb9q…pump</span></th>
+<td class="n">$42,180</td>
+<td class="n">$16,110</td>
+<td class="n chg">-62%</td>
+<td class="barcell"><span class="bar down" style="width:61.81%"></span></td>
+<td class="n age">12h</td>
+<td class="n age">2</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">MILKERS</span>
+<span class="mint">3Zmci1…pump</span></th>
+<td class="n">$16,730</td>
+<td class="n">$8,366</td>
+<td class="n chg">-50%</td>
+<td class="barcell"><span class="bar down" style="width:49.99%"></span></td>
+<td class="n age">0h</td>
+<td class="n age">3</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">Pistache</span>
+<span class="mint">34AnX3…pump</span></th>
+<td class="n">$19,216</td>
+<td class="n">$9,929</td>
+<td class="n chg">-48%</td>
+<td class="barcell"><span class="bar down" style="width:48.33%"></span></td>
+<td class="n age">1h</td>
+<td class="n age">3</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">Bold</span>
+<span class="mint">DaqX9c…pump</span></th>
+<td class="n">$22,985</td>
+<td class="n">$12,114</td>
+<td class="n chg">-47%</td>
+<td class="barcell"><span class="bar down" style="width:47.3%"></span></td>
+<td class="n age">6h</td>
+<td class="n age">6</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">WINFREY</span>
+<span class="mint">5RY49D…pump</span></th>
+<td class="n">$26,810</td>
+<td class="n">$15,424</td>
+<td class="n chg">-42%</td>
+<td class="barcell"><span class="bar down" style="width:42.47%"></span></td>
+<td class="n age">14h</td>
+<td class="n age">3</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">Opossum</span>
+<span class="mint">3Cminy…pump</span></th>
+<td class="n">$16,663</td>
+<td class="n">$9,862</td>
+<td class="n chg">-41%</td>
+<td class="barcell"><span class="bar down" style="width:40.81%"></span></td>
+<td class="n age">5h</td>
+<td class="n age">2</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">SpaceCat</span>
+<span class="mint">AY6dVd…pump</span></th>
+<td class="n">$55,390</td>
+<td class="n">$33,646</td>
+<td class="n chg">-39%</td>
+<td class="barcell"><span class="bar down" style="width:39.26%"></span></td>
+<td class="n age">7h</td>
+<td class="n age">29</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">BARK</span>
+<span class="mint">BTKfTU…pump</span></th>
+<td class="n">$25,901</td>
+<td class="n">$15,760</td>
+<td class="n chg">-39%</td>
+<td class="barcell"><span class="bar down" style="width:39.15%"></span></td>
+<td class="n age">15h</td>
+<td class="n age">52</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">C4T</span>
+<span class="mint">2sLKA6…pump</span></th>
+<td class="n">$46,394</td>
+<td class="n">$28,629</td>
+<td class="n chg">-38%</td>
+<td class="barcell"><span class="bar down" style="width:38.29%"></span></td>
+<td class="n age">7h</td>
+<td class="n age">122</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">BADGERS</span>
+<span class="mint">V6Maee…pump</span></th>
+<td class="n">$39,520</td>
+<td class="n">$26,087</td>
+<td class="n chg">-34%</td>
+<td class="barcell"><span class="bar down" style="width:33.99%"></span></td>
+<td class="n age">3h</td>
+<td class="n age">9</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">MEMESTONK</span>
+<span class="mint">BCJ9Gt…DgMS</span></th>
+<td class="n">$69,067</td>
+<td class="n">$47,797</td>
+<td class="n chg">-31%</td>
+<td class="barcell"><span class="bar down" style="width:30.8%"></span></td>
+<td class="n age">13h</td>
+<td class="n age">1</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">ZOLAR</span>
+<span class="mint">6bcRsA…pump</span></th>
+<td class="n">$24,407</td>
+<td class="n">$18,309</td>
+<td class="n chg">-25%</td>
+<td class="barcell"><span class="bar down" style="width:24.99%"></span></td>
+<td class="n age">7h</td>
+<td class="n age">12</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">BATON</span>
+<span class="mint">6Hebn6…pump</span></th>
+<td class="n">$85,961</td>
+<td class="n">$65,505</td>
+<td class="n chg">-24%</td>
+<td class="barcell"><span class="bar down" style="width:23.8%"></span></td>
+<td class="n age">14h</td>
+<td class="n age">35</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">kylie</span>
+<span class="mint">6b7KQs…pump</span></th>
+<td class="n">$32,838</td>
+<td class="n">$26,804</td>
+<td class="n chg">-18%</td>
+<td class="barcell"><span class="bar down" style="width:18.38%"></span></td>
+<td class="n age">13h</td>
+<td class="n age">8</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">George</span>
+<span class="mint">4kqEki…pump</span></th>
+<td class="n">$35,554</td>
+<td class="n">$30,432</td>
+<td class="n chg">-14%</td>
+<td class="barcell"><span class="bar down" style="width:14.4%"></span></td>
+<td class="n age">7h</td>
+<td class="n age">30</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">Dinger</span>
+<span class="mint">7fmHqR…hz35</span></th>
+<td class="n">$39,747</td>
+<td class="n">$34,237</td>
+<td class="n chg">-14%</td>
+<td class="barcell"><span class="bar down" style="width:13.86%"></span></td>
+<td class="n age">14h</td>
+<td class="n age">7</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">BADGER</span>
+<span class="mint">2FZjoW…pump</span></th>
+<td class="n">$21,421</td>
+<td class="n">$18,499</td>
+<td class="n chg">-14%</td>
+<td class="barcell"><span class="bar down" style="width:13.64%"></span></td>
+<td class="n age">3h</td>
+<td class="n age">1</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">SMOLCAT</span>
+<span class="mint">9Y3fY1…pump</span></th>
+<td class="n">$30,902</td>
+<td class="n">$27,053</td>
+<td class="n chg">-12%</td>
+<td class="barcell"><span class="bar down" style="width:12.46%"></span></td>
+<td class="n age">7h</td>
+<td class="n age">4</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">Morty</span>
+<span class="mint">GUmbtf…pump</span></th>
+<td class="n">$145,701</td>
+<td class="n">$128,143</td>
+<td class="n chg">-12%</td>
+<td class="barcell"><span class="bar down" style="width:12.05%"></span></td>
+<td class="n age">13h</td>
+<td class="n age">6</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">Zoe</span>
+<span class="mint">7n8kRi…pump</span></th>
+<td class="n">$127,127</td>
+<td class="n">$114,106</td>
+<td class="n chg">-10%</td>
+<td class="barcell"><span class="bar down" style="width:10.24%"></span></td>
+<td class="n age">14h</td>
+<td class="n age">42</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">DRILLPIG</span>
+<span class="mint">5BFBMW…pump</span></th>
+<td class="n">$19,337</td>
+<td class="n">$17,627</td>
+<td class="n chg">-9%</td>
+<td class="barcell"><span class="bar down" style="width:8.84%"></span></td>
+<td class="n age">5h</td>
+<td class="n age">33</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">TOADSTACIO</span>
+<span class="mint">2UJ8De…pump</span></th>
+<td class="n">$23,992</td>
+<td class="n">$23,070</td>
+<td class="n chg">-4%</td>
+<td class="barcell"><span class="bar down" style="width:3.84%"></span></td>
+<td class="n age">0h</td>
+<td class="n age">1</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="mild">
+<th scope="row"><span class="stripe"></span><span class="sym">CRASHOUT</span>
+<span class="mint">DyH4HX…pump</span></th>
+<td class="n">$18,022</td>
+<td class="n">$17,555</td>
+<td class="n chg">-3%</td>
+<td class="barcell"><span class="bar down" style="width:2.6%"></span></td>
+<td class="n age">2h</td>
+<td class="n age">2</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="none">
+<th scope="row"><span class="stripe"></span><span class="sym">HOMER</span>
+<span class="mint">4kW1UL…urDN</span></th>
+<td class="n">$0.0000</td>
+<td class="n">$0.0000</td>
+<td class="n chg">—</td>
+<td class="barcell"><span class="bar down" style="width:0%"></span></td>
+<td class="n age">5h</td>
+<td class="n age">1</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="none">
+<th scope="row"><span class="stripe"></span><span class="sym">悟空</span>
+<span class="mint">6AeDXF…L3ew</span></th>
+<td class="n">$0.0000</td>
+<td class="n">$0.0000</td>
+<td class="n chg">—</td>
+<td class="barcell"><span class="bar down" style="width:0%"></span></td>
+<td class="n age">4h</td>
+<td class="n age">2</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="none">
+<th scope="row"><span class="stripe"></span><span class="sym">DRILLPIG</span>
+<span class="mint">MZTb9Q…RH32</span></th>
+<td class="n">$0.0000</td>
+<td class="n">$0.0000</td>
+<td class="n chg">—</td>
+<td class="barcell"><span class="bar down" style="width:0%"></span></td>
+<td class="n age">4h</td>
+<td class="n age">8</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="none">
+<th scope="row"><span class="stripe"></span><span class="sym">Pistacio</span>
+<span class="mint">B97TMt…9Auu</span></th>
+<td class="n">$0.0000</td>
+<td class="n">$0.0000</td>
+<td class="n chg">—</td>
+<td class="barcell"><span class="bar down" style="width:0%"></span></td>
+<td class="n age">4h</td>
+<td class="n age">1</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="none">
+<th scope="row"><span class="stripe"></span><span class="sym">Pistacio</span>
+<span class="mint">EGAirV…ENFo</span></th>
+<td class="n">$0.0000</td>
+<td class="n">$0.0000</td>
+<td class="n chg">—</td>
+<td class="barcell"><span class="bar down" style="width:0%"></span></td>
+<td class="n age">3h</td>
+<td class="n age">5</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="none">
+<th scope="row"><span class="stripe"></span><span class="sym">dih</span>
+<span class="mint">2E6vYM…xjfL</span></th>
+<td class="n">$0.0000</td>
+<td class="n">$0.0000</td>
+<td class="n chg">—</td>
+<td class="barcell"><span class="bar down" style="width:0%"></span></td>
+<td class="n age">3h</td>
+<td class="n age">3</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="none">
+<th scope="row"><span class="stripe"></span><span class="sym">dog</span>
+<span class="mint">28j9kc…Z8Gd</span></th>
+<td class="n">$0.0000</td>
+<td class="n">$0.0000</td>
+<td class="n chg">—</td>
+<td class="barcell"><span class="bar down" style="width:0%"></span></td>
+<td class="n age">2h</td>
+<td class="n age">1</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="none">
+<th scope="row"><span class="stripe"></span><span class="sym">Pistacio</span>
+<span class="mint">3ac9WN…2Qiq</span></th>
+<td class="n">$0.0000</td>
+<td class="n">$0.0000</td>
+<td class="n chg">—</td>
+<td class="barcell"><span class="bar down" style="width:0%"></span></td>
+<td class="n age">1h</td>
+<td class="n age">4</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="none">
+<th scope="row"><span class="stripe"></span><span class="sym">ThreeUI</span>
+<span class="mint">GWun14…h7Sy</span></th>
+<td class="n">$0.0000</td>
+<td class="n">$0.0000</td>
+<td class="n chg">—</td>
+<td class="barcell"><span class="bar down" style="width:0%"></span></td>
+<td class="n age">1h</td>
+<td class="n age">6</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="ok">
+<th scope="row"><span class="stripe"></span><span class="sym">earl</span>
+<span class="mint">HTRcJr…pump</span></th>
+<td class="n">$40,422</td>
+<td class="n">$41,683</td>
+<td class="n chg">+3%</td>
+<td class="barcell"><span class="bar up" style="width:3.12%"></span></td>
+<td class="n age">3h</td>
+<td class="n age">11</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="ok">
+<th scope="row"><span class="stripe"></span><span class="sym">ber</span>
+<span class="mint">2nUCpT…pump</span></th>
+<td class="n">$22,105</td>
+<td class="n">$23,181</td>
+<td class="n chg">+5%</td>
+<td class="barcell"><span class="bar up" style="width:4.87%"></span></td>
+<td class="n age">3h</td>
+<td class="n age">3</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="ok">
+<th scope="row"><span class="stripe"></span><span class="sym">Ash</span>
+<span class="mint">4kKgb1…pump</span></th>
+<td class="n">$49,910</td>
+<td class="n">$52,743</td>
+<td class="n chg">+6%</td>
+<td class="barcell"><span class="bar up" style="width:5.68%"></span></td>
+<td class="n age">0h</td>
+<td class="n age">2</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="ok">
+<th scope="row"><span class="stripe"></span><span class="sym">GOON</span>
+<span class="mint">6xbZRQ…pump</span></th>
+<td class="n">$34,314</td>
+<td class="n">$36,540</td>
+<td class="n chg">+6%</td>
+<td class="barcell"><span class="bar up" style="width:6.49%"></span></td>
+<td class="n age">7h</td>
+<td class="n age">3</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="ok">
+<th scope="row"><span class="stripe"></span><span class="sym">SABL</span>
+<span class="mint">DaPayq…pump</span></th>
+<td class="n">$37,052</td>
+<td class="n">$40,966</td>
+<td class="n chg">+11%</td>
+<td class="barcell"><span class="bar up" style="width:10.57%"></span></td>
+<td class="n age">6h</td>
+<td class="n age">28</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="ok">
+<th scope="row"><span class="stripe"></span><span class="sym">Pistacia</span>
+<span class="mint">2WbTSr…pump</span></th>
+<td class="n">$42,888</td>
+<td class="n">$47,529</td>
+<td class="n chg">+11%</td>
+<td class="barcell"><span class="bar up" style="width:10.82%"></span></td>
+<td class="n age">3h</td>
+<td class="n age">8</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="ok">
+<th scope="row"><span class="stripe"></span><span class="sym">Polycat</span>
+<span class="mint">B4iCqV…pump</span></th>
+<td class="n">$70,047</td>
+<td class="n">$85,625</td>
+<td class="n chg">+22%</td>
+<td class="barcell"><span class="bar up" style="width:22.24%"></span></td>
+<td class="n age">12h</td>
+<td class="n age">76</td>
+<td class="gate">passed</td>
+</tr>
+<tr class="ok">
+<th scope="row"><span class="stripe"></span><span class="sym">fish</span>
+<span class="mint">wraeuV…pump</span></th>
+<td class="n">$27,706</td>
+<td class="n">$34,281</td>
+<td class="n chg">+24%</td>
+<td class="barcell"><span class="bar up" style="width:23.73%"></span></td>
+<td class="n age">3h</td>
+<td class="n age">5</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="ok">
+<th scope="row"><span class="stripe"></span><span class="sym">TRUMPPISTA</span>
+<span class="mint">EumP1q…pump</span></th>
+<td class="n">$28,736</td>
+<td class="n">$41,957</td>
+<td class="n chg">+46%</td>
+<td class="barcell"><span class="bar up" style="width:46.01%"></span></td>
+<td class="n age">0h</td>
+<td class="n age">10</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="ok">
+<th scope="row"><span class="stripe"></span><span class="sym">fih</span>
+<span class="mint">547tWx…pump</span></th>
+<td class="n">$44,218</td>
+<td class="n">$90,048</td>
+<td class="n chg">+104%</td>
+<td class="barcell"><span class="bar up" style="width:100%"></span></td>
+<td class="n age">7h</td>
+<td class="n age">19</td>
+<td class="gate">blocked</td>
+</tr>
+<tr class="ok">
+<th scope="row"><span class="stripe"></span><span class="sym">Sue</span>
+<span class="mint">2NffKv…pump</span></th>
+<td class="n">$37,137</td>
+<td class="n">$113,039</td>
+<td class="n chg">+204%</td>
+<td class="barcell"><span class="bar up" style="width:100%"></span></td>
+<td class="n age">14h</td>
+<td class="n age">20</td>
+<td class="gate">passed</td>
+</tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="footnotes">
+    <div class="fn"><h2>What the gate settles</h2>
+    <p><b>Passed</b> means the creator probably cannot burn, freeze, tax or block your
+    tokens. It says nothing about whether the price holds — and a soft rug, a dev quietly
+    selling into buyers, breaks no rule and passes every check here.</p></div>
+
+    <div class="fn"><h2>Why so many collapse</h2>
+    <p>Solidus Labs found <b>98.6%</b> of 7M+ pump.fun tokens fell below $1k liquidity or
+    were outright rugs. A register this brutal is the base rate showing up, not a fault in
+    the filter.</p></div>
+
+    <div class="fn"><h2>Sample size</h2>
+    <p>No token has yet aged past the 24-hour mark needed for a verdict, so no rate is quoted. The change column is what happened so far, not a conclusion.</p></div>
+  </div>
+</div>

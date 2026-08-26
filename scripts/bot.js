@@ -131,6 +131,21 @@ export async function main(argv, injected = {}) {
       { force: true },
     );
     out(`test message: ${res.status}${res.detail ? ` (${res.detail})` : ''}`);
+    if (res.status !== 'sent') {
+      // "chat not found" is the single most common first-run failure and the
+      // message is unhelpfully cryptic: a Telegram bot may not open a
+      // conversation, so it cannot message anyone who has not messaged it first.
+      // The credentials are fine; the chat simply does not exist yet.
+      if (/chat not found/i.test(String(res.detail))) {
+        out('');
+        out(`  The token is valid -- it connected as @${username}. The problem is that`);
+        out('  a bot cannot start a conversation. Open Telegram, search for');
+        out(`  @${username}, and send it /start (or any message). Then run this again.`);
+      } else if (/chat_id|chat id/i.test(String(res.detail))) {
+        out('');
+        out('  TELEGRAM_CHAT_ID looks wrong. Message @userinfobot to get yours.');
+      }
+    }
     return res.status === 'sent' ? EXIT.OK : EXIT.ERROR;
   }
 
