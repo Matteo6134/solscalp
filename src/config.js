@@ -413,6 +413,15 @@ export const LABELS = Object.freeze({
    * label line on every run.
    */
   relabelAfterHours: 24,
+  /**
+   * How often the RECORDER runs a labelling pass. Not a command anyone has to
+   * remember: 136 snapshots accumulated with zero labels before the gap was
+   * noticed, which made the whole dataset unscoreable while looking healthy.
+   * The recorder owns data/recordings and already talks to Dexscreener, so it is
+   * the right owner -- a separate labelling process would compete for the same
+   * per-IP rate limit.
+   */
+  autoLabelEveryMinutes: 30,
   /** Line type used for appended label records, so readers can tell them apart. */
   recordType: 'labels',
 });

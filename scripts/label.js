@@ -1,38 +1,30 @@
 #!/usr/bin/env node
 /**
- * Label what actually happened to recorded tokens. The missing half of the
- * evidence engine.
+ * Print one labelling pass. THIN: the pass itself lives in
+ * src/evidence/labeller.js and is also run by the recorder on a timer.
  *
- * scripts/record.js writes every candidate with `outcome: null` and a comment
- * saying "filled in later by a labelling pass". This is that pass. Without it the
- * recording can never be scored and backtest-rug-filter.js prints "NO RATE
- * REPORTED" forever, however long you run the recorder.
+ * YOU DO NOT NORMALLY NEED THIS COMMAND
+ *   The recorder labels every RECORDER.autoLabelEveryMinutes, because leaving it
+ *   to a person meant 136 snapshots accumulated with zero labels while everything
+ *   looked healthy. This exists for when you want to see a pass in detail, force
+ *   one now, or try different thresholds with --min-age-hours.
  *
- * APPEND-ONLY, LIKE THE RECORDER
- *   The snapshots are never rewritten. Labels are appended as their own line
- *   type, and the backtest merges them on read. That keeps the raw observations
- *   exactly as they were taken -- if the thresholds in LABELS turn out wrong, the
- *   dataset can be relabelled from the stored evidence without re-collecting.
- *
- * IT LABELS BLOCKED TOKENS TOO, AND THAT IS THE POINT
- *   Labelling only the approvals tells you the filter's rug rate. Labelling the
- *   REJECTS as well tells you whether the filter is discriminating at all -- a
- *   gate that approves 10% ruggers is worthless if the ones it blocked rugged at
- *   the same rate. That comparison is the actual measure of skill, and it is free
- *   here because the rejects are already in the file.
+ * One implementation, two callers: a second copy of the labelling rules would
+ * drift from the one the recorder uses, and then the dataset would contain
+ * labels produced by two slightly different definitions of "rugged".
  */
 
-import { appendFile, readdir, readFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import { LABELS, RECORDER } from '../src/config.js';
-import { getBestPairs } from '../src/data/dexscreener.js';
-import { LABEL, decideOutcome, shouldRelabel } from '../src/evidence/outcome.js';
+import { runLabellingPass } from '../src/evidence/labeller.js';
+import { LABEL } from '../src/evidence/outcome.js';
 import { EXIT, isMain, line, parseArgs, runMain, usd } from './lib/cli.js';
 
 const USAGE = `usage: npm run label -- [--dir PATH] [--dry-run] [--min-age-hours N]
 
 Re-visits recorded tokens, measures what happened to their pool, and appends
-outcome labels. Run it whenever you like -- it is idempotent and cheap.
+outcome labels. Idempotent and cheap.
+
+The recorder already does this every ${LABELS.autoLabelEveryMinutes} minutes, so you rarely need it.
 
   --dir PATH          recordings directory (default ${RECORDER.dir})
   --min-age-hours N   override LABELS.minAgeHoursBeforeLabelling (${LABELS.minAgeHoursBeforeLabelling})
@@ -42,54 +34,8 @@ outcome labels. Run it whenever you like -- it is idempotent and cheap.
   0 = labels written   1 = nothing to label   2 = internal error
 `;
 
-/**
- * Fold the JSONL into: the first observation per mint, and the latest label per
- * mint. Pure, so the merge rules are testable without a disk.
- *
- * @param {readonly string[]} lines
- * @returns {{observations: Map<string, object>, labels: Map<string, object>, malformed: number}}
- */
-export function readDataset(lines) {
-  const observations = new Map();
-  const labels = new Map();
-  let malformed = 0;
-
-  for (const raw of lines) {
-    const text = raw.trim();
-    if (text === '') continue;
-    let record;
-    try {
-      record = JSON.parse(text);
-    } catch {
-      malformed += 1;
-      continue;
-    }
-    if (record?.schemaVersion !== RECORDER.schemaVersion) {
-      malformed += 1;
-      continue;
-    }
-
-    if (record.type === LABELS.recordType) {
-      for (const entry of record.labels ?? []) {
-        if (typeof entry?.mint !== 'string') continue;
-        const prior = labels.get(entry.mint);
-        // Keep the most recent label for each mint.
-        if (prior === undefined || (entry.ts ?? 0) >= (prior.ts ?? 0)) labels.set(entry.mint, entry);
-      }
-      continue;
-    }
-
-    for (const candidate of record.candidates ?? []) {
-      if (typeof candidate?.mint !== 'string') continue;
-      // FIRST observation wins: that is the decision the filter would have traded
-      // on, and the liquidity we must measure the collapse against.
-      if (!observations.has(candidate.mint)) {
-        observations.set(candidate.mint, { ...candidate, recordedTs: record.ts });
-      }
-    }
-  }
-  return { observations, labels, malformed };
-}
+/** Re-exported so callers keep one definition of the fold. */
+export { readDataset } from '../src/evidence/labeller.js';
 
 /**
  * @param {readonly string[]} argv
@@ -104,51 +50,35 @@ export async function main(argv, deps = {}) {
     return EXIT.OK;
   }
 
-  const dir = typeof flags.dir === 'string' ? flags.dir : RECORDER.dir;
-  const now = (deps.now ?? Date.now)();
-  const dryRun = flags['dry-run'] === true;
   const thresholds =
     flags['min-age-hours'] === undefined
       ? LABELS
       : Object.freeze({ ...LABELS, minAgeHoursBeforeLabelling: Number(flags['min-age-hours']) });
 
-  let files;
-  try {
-    files = (await (deps.readdir ?? readdir)(dir)).filter((f) => f.endsWith('.jsonl'));
-  } catch {
-    out(`no recordings directory at ${dir}. Run "npm run record" first.`);
-    return EXIT.NEGATIVE;
-  }
-  if (files.length === 0) {
-    out(`no .jsonl recordings in ${dir}.`);
-    return EXIT.NEGATIVE;
-  }
-
-  const lines = [];
-  for (const file of files) {
-    lines.push(...(await (deps.readFile ?? readFile)(join(dir, file), 'utf8')).split('\n'));
-  }
-  const { observations, labels, malformed } = readDataset(lines);
-
-  const due = [...observations.values()].filter((o) => {
-    const prior = labels.get(o.mint);
-    return shouldRelabel({
-      lastLabelledTs: prior?.ts ?? null,
-      lastLabel: prior?.outcome ?? null,
-      now,
+  const pass = await (deps.runLabellingPass ?? runLabellingPass)(
+    {
+      dir: typeof flags.dir === 'string' ? flags.dir : RECORDER.dir,
+      now: (deps.now ?? Date.now)(),
+      dryRun: flags['dry-run'] === true,
       thresholds,
-    });
-  });
+    },
+    deps,
+  );
+
+  if (flags.json === true) {
+    out(JSON.stringify(pass, null, 2));
+    return pass.written > 0 ? EXIT.OK : EXIT.NEGATIVE;
+  }
 
   out(line('='));
   out('OUTCOME LABELLING');
   out(line('='));
-  out(`  files            ${files.length}${malformed > 0 ? `  (${malformed} malformed lines skipped)` : ''}`);
-  out(`  mints observed   ${observations.size}`);
-  out(`  already labelled ${labels.size}`);
-  out(`  due for a look   ${due.length}`);
+  out(`  files            ${pass.files}${pass.malformed > 0 ? `  (${pass.malformed} malformed lines skipped)` : ''}`);
+  out(`  mints observed   ${pass.observed}`);
+  out(`  already labelled ${pass.alreadyLabelled}`);
+  out(`  due for a look   ${pass.due}`);
 
-  if (due.length === 0) {
+  if (pass.due === 0) {
     out('');
     out('Nothing to label. Either everything is current, or nothing has aged past');
     out(`${thresholds.minAgeHoursBeforeLabelling}h yet. Keep the recorder running.`);
@@ -156,42 +86,13 @@ export async function main(argv, deps = {}) {
     return EXIT.NEGATIVE;
   }
 
-  // One batched lookup for every mint at once (30 per request, handled by the client).
-  const fetchPairs = deps.getBestPairs ?? getBestPairs;
-  let current;
-  try {
-    current = await fetchPairs(due.map((o) => o.mint));
-  } catch (err) {
-    out(`could not reach Dexscreener: ${err?.message ?? err}`);
-    out('Refusing to label anything: an outage must not be recorded as dead pools.');
-    return EXIT.ERROR;
-  }
-  // If NOTHING came back, the source is down rather than every pool being gone.
-  const answered = [...current.values()].filter((p) => p !== null).length;
-  const apiHealthy = answered > 0;
-
-  const decided = due.map((o) => {
-    const verdict = decideOutcome({
-      recordedTs: o.recordedTs,
-      recordedLiquidityUsd: o.liquidityUsd ?? null,
-      recordedPriceUsd: o.priceUsd ?? null,
-      current: current.get(o.mint) ?? null,
-      now,
-      apiHealthy,
-      thresholds,
-    });
-    return { observation: o, ...verdict };
-  });
-
-  const writable = decided.filter(
-    (d) => d.label === LABEL.RUGGED || d.label === LABEL.SURVIVED,
+  out('');
+  out(
+    `  source answered for ${pass.answered}/${pass.due} mints` +
+      (pass.answered === 0 ? '  <- treating as an OUTAGE' : ''),
   );
-  const counts = decided.reduce((acc, d) => ({ ...acc, [d.label]: (acc[d.label] ?? 0) + 1 }), {});
-
   out('');
-  out(`  source answered for ${answered}/${due.length} mints` + (apiHealthy ? '' : '  <- treating as an OUTAGE'));
-  out('');
-  for (const d of decided.slice(0, 25)) {
+  for (const d of pass.decided.slice(0, 25)) {
     const mark = d.label === LABEL.RUGGED ? 'RUG ' : d.label === LABEL.SURVIVED ? 'LIVE' : '?   ';
     out(
       `  ${mark} ${d.observation.mint.slice(0, 10).padEnd(12)}` +
@@ -200,48 +101,26 @@ export async function main(argv, deps = {}) {
         `   ${d.reasons[0] ?? ''}`.slice(0, 74),
     );
   }
-  if (decided.length > 25) out(`  ... and ${decided.length - 25} more`);
+  if (pass.decided.length > 25) out(`  ... and ${pass.decided.length - 25} more`);
 
+  const c = pass.counts;
   out('');
-  out(`  rugged ${counts[LABEL.RUGGED] ?? 0}   survived ${counts[LABEL.SURVIVED] ?? 0}` +
-    `   too-early ${counts[LABEL.TOO_EARLY] ?? 0}   unknown ${counts[LABEL.UNKNOWN] ?? 0}`);
+  out(
+    `  rugged ${c[LABEL.RUGGED] ?? 0}   survived ${c[LABEL.SURVIVED] ?? 0}` +
+      `   too-early ${c[LABEL.TOO_EARLY] ?? 0}   unknown ${c[LABEL.UNKNOWN] ?? 0}`,
+  );
 
-  if (writable.length === 0) {
+  if (pass.written === 0) {
     out('');
-    out('No conclusive outcomes this pass. Nothing appended -- an unknown is never');
-    out('written as a label, because a wrong "survived" flatters the filter.');
+    out(`Nothing appended: ${pass.reason ?? 'no conclusive outcomes'}.`);
+    out('An unknown is never written as a label, because a wrong "survived"');
+    out('flatters the filter.');
     out(line('-'));
     return EXIT.NEGATIVE;
   }
 
-  const record = {
-    schemaVersion: RECORDER.schemaVersion,
-    type: LABELS.recordType,
-    ts: now,
-    iso: new Date(now).toISOString(),
-    labels: writable.map((d) => ({
-      mint: d.observation.mint,
-      symbol: d.observation.symbol ?? null,
-      outcome: d.label,
-      ts: now,
-      observedTs: d.observation.recordedTs,
-      gateBuyable: d.observation.gate?.buyable ?? null,
-      reasons: [...d.reasons],
-      evidence: d.evidence,
-    })),
-  };
-
-  if (dryRun) {
-    out('');
-    out(`--dry-run: would append ${writable.length} label(s), nothing written.`);
-    out(line('-'));
-    return EXIT.OK;
-  }
-
-  const target = join(dir, `${new Date(now).toISOString().slice(0, 10)}.jsonl`);
-  await (deps.appendFile ?? appendFile)(target, `${JSON.stringify(record)}\n`, 'utf8');
   out('');
-  out(`  appended ${writable.length} label(s) to ${target}`);
+  out(`  appended ${pass.written} label(s) to ${pass.target}`);
   out('  (appended, never rewritten -- the raw observations are untouched)');
   out(line('-'));
   out('Now run:  npm run backtest:rug');

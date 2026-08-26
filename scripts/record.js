@@ -30,6 +30,7 @@ import { RECORDER, STRATEGY, UNIVERSE_PROFILES } from '../src/config.js';
 import { getBestPairs } from '../src/data/dexscreener.js';
 import { getTrendingPools } from '../src/data/geckoterminal.js';
 import { loadEnv } from '../src/env.js';
+import { runLabellingPass } from '../src/evidence/labeller.js';
 import { readSignals, universeReasons } from '../src/paper/engine.js';
 import { runGate } from '../src/safety/index.js';
 import { EXIT, buildRpc, intFlag, isMain, parseArgs, runMain, say } from './lib/cli.js';
@@ -161,6 +162,10 @@ export async function main(argv, deps = {}) {
 
   let ticks = 0;
   let written = 0;
+  // Label on a timer rather than on demand. Starts at 0 so the first pass runs
+  // on the first tick: if the process has been down, there is catching up to do.
+  let lastLabelAt = 0;
+  let labelled = 0;
   let stopped = false;
   const stop = () => {
     stopped = true;
@@ -194,6 +199,29 @@ export async function main(argv, deps = {}) {
       // a gap in the data is far better than losing the run.
       out(`[tick failed, continuing] ${err?.message ?? err}`);
     }
+    // --- periodic labelling: maintenance of the dataset we just appended to ---
+    if (ts - lastLabelAt >= RECORDER.autoLabelEveryMinutes * 60 * MS_PER_SECOND) {
+      lastLabelAt = ts;
+      try {
+        const pass = await (deps.runLabellingPass ?? runLabellingPass)({ dir, now: ts });
+        labelled += pass.written;
+        if (pass.written > 0) {
+          const c = pass.counts;
+          out(
+            `[label] wrote ${pass.written} outcome(s): ` +
+              `${c.rugged ?? 0} rugged, ${c.survived ?? 0} survived ` +
+              `(${labelled} total this run)`,
+          );
+        } else if (pass.reason !== 'nothing due') {
+          out(`[label] ${pass.reason}`);
+        }
+      } catch (err) {
+        // Labelling must never be able to stop the recording. The snapshots are
+        // the irreplaceable part; a label can always be recomputed later.
+        out(`[label failed, recording continues] ${err?.message ?? err}`);
+      }
+    }
+
     ticks += 1;
     if (!stopped && ticks < maxTicks) await sleep(intervalS * MS_PER_SECOND);
   }
