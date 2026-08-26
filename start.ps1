@@ -38,8 +38,32 @@ if (-not (Test-Path (Join-Path $root '.env'))) {
 }
 New-Item -ItemType Directory -Force -Path (Join-Path $root 'data') | Out-Null
 
+# Already running? Then do nothing.
+#
+# This guard is the whole reason today went wrong. Repeated launches produced
+# five bot processes, each holding the Telegram token that was in .env when IT
+# started -- so alerts kept arriving from a bot that had already been replaced --
+# and each running its own paper portfolio, which reported +$8 and -$8 for the
+# same token in two different chats. Six processes then exhausted GeckoTerminal's
+# 30 req/min per-IP budget between them.
+#
+# An autostart entry makes an accidental double-launch far more likely (log in
+# while it is already running), so refusing is the only safe default.
+function Get-Running {
+  param([string]$ScriptName)
+  Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and $_.CommandLine -like "*$ScriptName*" }
+}
+
 function Start-Solscalp {
   param([string]$Name, [string]$Script, [string[]]$ScriptArgs)
+
+  $existing = Get-Running -ScriptName $Script
+  if ($existing) {
+    $pids = ($existing | ForEach-Object { $_.ProcessId }) -join ', '
+    Write-Host ("  {0,-8} already running (pid {1}) - not starting another" -f $Name, $pids) -ForegroundColor Yellow
+    return $null
+  }
 
   # Our own log sink: independent of any process manager's capture, because that
   # capture is exactly what proved unreliable here.
@@ -61,17 +85,22 @@ Write-Host ""
 $started = @()
 if ($Only -eq 'all' -or $Only -eq 'record') {
   # The evidence collector. This is the one that must not miss time.
-  $started += Start-Solscalp -Name 'record' -Script 'scripts/record.js' -ScriptArgs @('--early')
+  $new = Start-Solscalp -Name 'record' -Script 'scripts/record.js' -ScriptArgs @('--early')
+  if ($new) { $started += $new }
 }
 if ($Only -eq 'all' -or $Only -eq 'bot') {
   # 60s keeps the pair inside GeckoTerminal's 30 req/min per-IP budget; the
   # limiters are per-process and cannot see each other.
-  $started += Start-Solscalp -Name 'bot' -Script 'scripts/bot.js' `
+  $new = Start-Solscalp -Name 'bot' -Script 'scripts/bot.js' `
     -ScriptArgs @('--early', '--paper', '--interval', '60')
 }
 
 Write-Host ""
-Write-Host "Verifying they are actually working (not merely running)..." -ForegroundColor Cyan
+if ($started.Count -eq 0) {
+  Write-Host "Nothing needed starting. Current state:" -ForegroundColor Cyan
+} else {
+  Write-Host "Verifying they are actually working (not merely running)..." -ForegroundColor Cyan
+}
 $before = 0
 $today = Join-Path $root ("data\recordings\" + (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd') + '.jsonl')
 if (Test-Path $today) { $before = (Get-Content $today | Measure-Object -Line).Lines }
@@ -81,7 +110,7 @@ $alive = @()
 foreach ($id in $started) {
   if (Get-Process -Id $id -ErrorAction SilentlyContinue) { $alive += $id }
 }
-Write-Host ("  processes alive: {0}/{1}" -f $alive.Count, $started.Count)
+if ($started.Count -gt 0) { Write-Host ("  newly started and alive: {0}/{1}" -f $alive.Count, $started.Count) }
 foreach ($n in @('record', 'bot')) {
   $f = Join-Path $root "data\$n.log"
   if (Test-Path $f) {
@@ -94,3 +123,5 @@ Write-Host "Logs:  data\record.log  data\bot.log" -ForegroundColor DarkGray
 Write-Host "Stop:  npm run stop" -ForegroundColor DarkGray
 Write-Host "A running process keeps the credentials it loaded at startup -- editing" -ForegroundColor DarkGray
 Write-Host ".env does not reach it, so restart after changing a token." -ForegroundColor DarkGray
+
+
