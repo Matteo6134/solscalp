@@ -23,7 +23,7 @@
  */
 
 import pLimit from 'p-limit';
-import { MODES, NOTIFY, RISK, SAFETY, STRATEGY, UNIVERSE_PROFILES } from '../src/config.js';
+import { MODES, NOTIFY, RECORDER, RISK, SAFETY, STRATEGY, UNIVERSE_PROFILES } from '../src/config.js';
 import { getBestPairs } from '../src/data/dexscreener.js';
 import { getNewPools, getTopPools, getTrendingPools } from '../src/data/geckoterminal.js';
 import { loadEnv } from '../src/env.js';
@@ -41,6 +41,7 @@ import {
   formatSignal,
   formatStatus,
 } from '../src/notify/format.js';
+import { isRecorderHealthy, latestSnapshot } from '../src/evidence/tail.js';
 import { createNotifier } from '../src/notify/telegram.js';
 import {
   createEngineState,
@@ -65,6 +66,10 @@ Sends alerts to Telegram and answers commands from it. Long-running.
   --feed F      trending (default) | top | new
   --early       use UNIVERSE_PROFILES.early (smaller caps, younger pairs)
   --paper       also run the paper engine, so open/close alerts fire
+  --scan        fetch the market itself instead of reading the recorder output.
+                Doubles the API load: the limits are per IP and the limiters are
+                per process, so two scanners starve each other. Default is to
+                read what the recorder already fetched, screened and gated.
   --no-commands send alerts only, do not poll for commands. Use this when the
                 token is shared with another running bot (Telegram allows only
                 ONE getUpdates consumer per token; alerts do not conflict)
@@ -164,9 +169,15 @@ export async function main(argv, injected = {}) {
     gate: injected.runGate ?? runGate,
     recheck: injected.recheckGate ?? recheckGate,
     rpc: injected.rpc ?? (await buildRpc(env)),
+    latestSnapshot: injected.latestSnapshot ?? latestSnapshot,
+    isRecorderHealthy: injected.isRecorderHealthy ?? isRecorderHealthy,
+    recorderIntervalSeconds: RECORDER.snapshotIntervalSeconds,
   };
   const universe = flags.early === true ? UNIVERSE_PROFILES.early : undefined;
   const paperEnabled = flags.paper === true;
+  // Default ON: exactly one process should talk to each upstream. Pass --scan to
+  // make the bot fetch for itself, which doubles the API load.
+  const fromRecording = flags.scan !== true;
   const intervalMs = intFlag(flags.interval, STRATEGY.tickSeconds) * MS_PER_SECOND;
   const limit = intFlag(flags.limit, 8);
   const startedAt = deps.now();
@@ -181,7 +192,8 @@ export async function main(argv, injected = {}) {
     funnel: { pools: 0, pairs: 0, screened: 0, gated: 0, safe: 0, wouldEnter: 0 },
   };
 
-  out(`bot running: feed=${feed} profile=${universe ? 'early' : 'standard'} paper=${paperEnabled}`);
+  out(`bot running: profile=${universe ? 'early' : 'standard'} paper=${paperEnabled} ` +
+    `source=${fromRecording ? 'recording (no upstream calls)' : 'live scan (feed=' + feed + ')'}`);
   out('Ctrl+C to stop. Alerts go to the configured chat only.');
   await notifier.send('🤖 <b>SOLSCALP started</b>\n<i>paper only</i>', { force: true });
 
@@ -223,7 +235,7 @@ export async function main(argv, injected = {}) {
 
   while (running) {
     try {
-      await cycle({ state, notifier, deps, universe, paperEnabled, limit });
+      await cycle({ state, notifier, deps, universe, paperEnabled, limit, fromRecording });
     } catch (err) {
       out(`cycle failed: ${err?.message ?? err}`);
       if (NOTIFY.events.dataSourceDown) {
@@ -246,28 +258,74 @@ export async function main(argv, injected = {}) {
 
 /* -------------------------------------------------------------------------- */
 
-async function cycle({ state, notifier, deps, universe, paperEnabled, limit }) {
-  const pools = await deps.fetchPools({ page: 1 });
-  const feedMints = [...new Set(pools.map((p) => p.baseMint).filter(Boolean))];
-  const held = Object.keys(state.engine.portfolio.positions);
-  const pairsByMint = await deps.fetchPairs([...new Set([...feedMints, ...held])]);
-  const pairs = [...pairsByMint.values()].filter((p) => p !== null);
-
+async function cycle({ state, notifier, deps, universe, paperEnabled, limit, fromRecording }) {
   const at = deps.now();
-  const screened = pairs
-    .filter((pair) => universeReasons(pair, at, universe).length === 0)
-    .map((pair) => ({ pair, signals: readSignals(pair, at) }))
-    .sort((a, b) => (b.signals.volumeAccelerationRatio ?? 0) - (a.signals.volumeAccelerationRatio ?? 0))
-    .slice(0, limit);
+  let screened;
+  let gateResults;
+  let pairs;
+  // In recording mode there is no pool feed of our own: the count is whatever the
+  // recorder observed, which is exactly what we want reported.
+  let poolsSeen = 0;
 
-  const gateLimit = pLimit(GATE_CONCURRENCY);
-  const gateResults = Object.fromEntries(
-    await Promise.all(
-      screened.map((row) =>
-        gateLimit(async () => [row.pair.mint, await deps.gate(row.pair.mint, { rpc: deps.rpc })]),
+  if (fromRecording) {
+    // ZERO upstream calls. The recorder already fetched, screened and gated this
+    // instant; re-doing it would double the API load for a second opinion on the
+    // same data, which is exactly what exhausted GeckoTerminal's per-IP budget.
+    const snap = await deps.latestSnapshot({ now: at });
+    state.snapshotAgeMs = snap.snapshotAgeMs;
+
+    if (!deps.isRecorderHealthy(snap.snapshotAgeMs, deps.recorderIntervalSeconds)) {
+      // A dead recorder must never look like a quiet market.
+      state.recorderStale = true;
+      if (NOTIFY.events.dataSourceDown && !state.alertsPaused) {
+        await notifier.send(
+          formatDataSourceDown({
+            detail:
+              snap.snapshotAgeMs === null
+                ? 'No recording found at all. Start the recorder: npm run start'
+                : `The recorder has not written for ${Math.round(snap.snapshotAgeMs / 1000)}s ` +
+                  '(expected every ' + deps.recorderIntervalSeconds + 's). Alerts are blind ' +
+                  'until it is back -- this silence is NOT a quiet market.',
+          }),
+          { key: 'recorder-stale' },
+        );
+      }
+      state.cycle += 1;
+      return;
+    }
+    state.recorderStale = false;
+    pairs = snap.pairs;
+    gateResults = snap.gateResults;
+    poolsSeen = snap.candidates.length;
+    screened = snap.pairs
+      .map((pair) => ({ pair, signals: readSignals(pair, at) }))
+      .sort((a, b) => (b.signals.volumeAccelerationRatio ?? 0) - (a.signals.volumeAccelerationRatio ?? 0))
+      .slice(0, limit);
+  } else {
+    const pools = await deps.fetchPools({ page: 1 });
+    const feedMints = [...new Set(pools.map((p) => p.baseMint).filter(Boolean))];
+    const held = Object.keys(state.engine.portfolio.positions);
+    const pairsByMint = await deps.fetchPairs([...new Set([...feedMints, ...held])]);
+    pairs = [...pairsByMint.values()].filter((p) => p !== null);
+    poolsSeen = pools.length;
+
+    screened = pairs
+      .filter((pair) => universeReasons(pair, at, universe).length === 0)
+      .map((pair) => ({ pair, signals: readSignals(pair, at) }))
+      .sort((a, b) => (b.signals.volumeAccelerationRatio ?? 0) - (a.signals.volumeAccelerationRatio ?? 0))
+      .slice(0, limit);
+
+    const gateLimit = pLimit(GATE_CONCURRENCY);
+    gateResults = Object.fromEntries(
+      await Promise.all(
+        screened.map((row) =>
+          gateLimit(async () => [row.pair.mint, await deps.gate(row.pair.mint, { rpc: deps.rpc })]),
+        ),
       ),
-    ),
-  );
+    );
+  }
+  const held = Object.keys(state.engine.portfolio.positions);
+  const gateLimit = pLimit(GATE_CONCURRENCY);
 
   const solPriceUsd = solPriceFrom(pairs);
   const costs = costsFor({ pairs: screened.map((r) => r.pair), gates: gateResults, solPriceUsd });
@@ -343,7 +401,7 @@ async function cycle({ state, notifier, deps, universe, paperEnabled, limit }) {
   state.cycle += 1;
   state.candidates = candidates;
   state.funnel = {
-    pools: pools.length,
+    pools: poolsSeen,
     pairs: pairs.length,
     screened: screened.length,
     gated: Object.keys(gateResults).length,

@@ -93,6 +93,7 @@ if ($Only -eq 'all' -or $Only -eq 'bot') {
   # limiters are per-process and cannot see each other.
   $new = Start-Solscalp -Name 'bot' -Script 'scripts/bot.js' `
     -ScriptArgs @('--early', '--paper', '--interval', '60')
+  if ($new) { $started += $new }
 }
 
 Write-Host ""

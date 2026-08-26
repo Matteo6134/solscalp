@@ -62,7 +62,12 @@ export function buildRecord({ ts, profile, rows }) {
     ts,
     iso: new Date(ts).toISOString(),
     profile,
-    candidates: rows.map(({ pair, signals, gate }) => ({
+    candidates: rows.map(({ pair, signals, gate }) => {
+    // Layer 1 measured the round trip; keep its price impacts so a consumer can
+    // price a trade without re-quoting Jupiter. Without these, decideEntry has no
+    // cost breakdown and correctly refuses every entry.
+    const sim = gate.layers.find((l) => l.layer === 'layer1-sellsim')?.facts ?? {};
+    return ({
       mint: pair.mint,
       symbol: pair.baseToken?.symbol ?? null,
       pairAddress: pair.pairAddress,
@@ -77,6 +82,13 @@ export function buildRecord({ ts, profile, rows }) {
       priceChangeH1Pct: signals.priceChangeH1Pct,
       buySellRatioM5: signals.buySellRatioM5,
       volumeAccelerationRatio: signals.volumeAccelerationRatio,
+      // Raw counters, so scripts/bot.js can rebuild these signals from the file
+      // rather than paying for the same fetch a second time. Added after two
+      // processes scanning the same endpoint exhausted GeckoTerminal's per-IP
+      // budget between them.
+      quoteMint: pair.quoteToken?.address ?? null,
+      pairCreatedAtMs: pair.pairCreatedAtMs ?? null,
+      txns: pair.txns ?? null,
       gate: {
         buyable: gate.buyable,
         complete: gate.complete,
@@ -88,9 +100,15 @@ export function buildRecord({ ts, profile, rows }) {
         reasons: [...gate.reasons],
         elapsedMs: gate.elapsedMs,
       },
+      roundTrip: {
+        buyPriceImpactPct: sim.buyPriceImpactPct ?? null,
+        sellPriceImpactPct: sim.sellPriceImpactPct ?? null,
+        roundTripLossPct: sim.roundTripLossPct ?? null,
+      },
       // Filled in later by a labelling pass; never assumed.
       outcome: null,
-    })),
+    });
+    }),
   };
 }
 
