@@ -1,383 +1,555 @@
 #!/usr/bin/env node
 /**
- * The one screen. Reads the recording; never fetches.
+ * The dashboard. Built on Ink, so the terminal gets a real layout engine.
  *
- * WHY IT READS INSTEAD OF SCANNING
- *   This used to run its own enumerate -> screen -> gate cycle. That made it a
- *   third process competing for the same per-IP rate limits as the recorder and
- *   the bot, and the limiters live inside each process and cannot see each other,
- *   so they starved one another until the loser spent every cycle reporting 429s.
+ * WHY INK AND NOT HAND-ROLLED ANSI
+ *   The previous version budgeted every column by hand against an unknown
+ *   terminal width. One line a character too long wrapped, which pushed every
+ *   line below it down and produced a screen of text sitting on top of itself --
+ *   measured at 81 and 86 characters on an 80-column terminal. Ink measures and
+ *   truncates for you, so that class of bug is gone structurally rather than
+ *   patched. It also diffs frames instead of repainting, so no flicker, and its
+ *   input handling works where raw-mode fiddling did not.
  *
- *   Reading the recorder's append-only JSONL instead fixes three things at once:
- *     - it costs NOTHING upstream, so it is safe to leave open forever;
- *     - it has HISTORY, because the recording is the history -- hours of ticks
- *       and every sighting of every token, not just this instant;
- *     - it REMEMBERS, because a restart re-reads the file. Nothing is lost by
- *       closing the window, which was not true of the in-memory version.
+ * THE THREE JOBS ARE ALREADY DECOUPLED
+ *   The usual reason a terminal dashboard freezes is that the render loop waits
+ *   on an API. That cause is absent here: this process makes NO upstream calls at
+ *   all. scripts/lib/dashData.js reads the recorder's append-only JSONL, the
+ *   recorder does the fetching in its own process, and keypresses are handled by
+ *   Ink's input hook independently of the read timer. So the interface cannot be
+ *   blocked by a slow Solana RPC, because it never talks to one.
+ *
+ * IT REMEMBERS
+ *   The recording is the history. Closing this window loses nothing, and a
+ *   restart re-reads hours of ticks and every sighting of every token.
  *
  * WHAT IT CANNOT DO
- *   It cannot see anything the recorder did not record. If the recorder stops,
- *   this screen freezes at the last snapshot -- so the header always shows the
- *   snapshot's AGE and turns red when it goes stale. A dashboard that looks calm
- *   while its source of truth is dead is worse than no dashboard.
- *
- * Views: [1] LIVE  [2] HISTORY  [3] EVIDENCE.  q or Ctrl+C to quit.
+ *   It cannot see anything the recorder did not record. If the recorder dies this
+ *   screen freezes -- so the header carries the snapshot age and turns red,
+ *   because a frozen screen otherwise looks exactly like a calm market.
  */
 
-import { readdir, readFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import { LABELS, RECORDER, RISK, STRATEGY } from '../src/config.js';
-import { LABEL } from '../src/evidence/outcome.js';
-import { isRecorderHealthy, latestSnapshot } from '../src/evidence/tail.js';
-import { readSignals } from '../src/paper/engine.js';
-import { BASE_RATE_PCT, MIN_SAMPLE, scoreRugFilter, tallyRecords } from './backtest-rug-filter.js';
-import { EXIT, isMain, intFlag, parseArgs, pct, runMain, usd } from './lib/cli.js';
-import { ANSI, pad, pane, paint, size, withScreen } from './lib/tui.js';
-import { activityStrip, buildWatchlist, sparkline } from './watchlist.js';
+import { Box, Text, render, useApp, useInput, useStdin } from 'ink';
+import { createElement as h, useEffect, useState } from 'react';
+import { RECORDER } from '../src/config.js';
+import { EMPTY, buildDashData } from './lib/dashData.js';
+import { EXIT, intFlag, isMain, parseArgs, runMain } from './lib/cli.js';
 
 const MS_PER_SECOND = 1_000;
-const MS_PER_HOUR = 3_600_000;
-const HEADER_ROWS = 2;
 const VIEWS = Object.freeze(['live', 'history', 'evidence']);
+const BLOCKS = Object.freeze(['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']);
 
-const USAGE = `usage: npm run dash -- [--refresh S] [--dir PATH]
+const USAGE = `usage: npm run dash -- [--refresh S] [--view V] [--dir PATH]
 
 One screen over the recorder's output. Makes no network calls of its own, so it
 is safe to leave running next to the recorder and the bot.
 
-  --refresh S  seconds between reads (default 5)
+  --refresh S  seconds between reads (default 3)
   --view V     start on live | history | evidence
   --dir PATH   recordings directory (default ${RECORDER.dir})
 
-  [1] LIVE      what the last scan saw, and the scan-activity history
-  [2] HISTORY   every token ever recorded, with its trace and outcome
-  [3] EVIDENCE  the labelled outcomes and what they do and do not support
-  [q] quit
+  1 / 2 / 3    switch view        <- / ->   also switch
+  r            re-read now        q         quit
 `;
 
-/* -------------------------------------------------------------------- read */
+/* ------------------------------------------------------------------ format */
 
-/** Everything the screen needs, straight off disk. No network. */
-async function readState({ dir, now }, deps = {}) {
-  const list = deps.readdir ?? readdir;
-  const read = deps.readFile ?? readFile;
-  let files = [];
-  try {
-    files = (await list(dir)).filter((f) => f.endsWith('.jsonl')).sort();
-  } catch {
-    /* no directory yet: everything below degrades to empty, which is honest */
-  }
-  const lines = [];
-  for (const file of files) {
-    try {
-      lines.push(...(await read(join(dir, file), 'utf8')).split('\n'));
-    } catch {
-      /* a file that vanished mid-read is not worth failing the whole screen for */
-    }
-  }
-  const { rows, ticks } = buildWatchlist(lines);
-  const snap = await latestSnapshot({ dir, now }, deps);
-  return { files, lines, rows, ticks, snap };
+const usd = (n) =>
+  n === null || n === undefined || !Number.isFinite(n)
+    ? '—'
+    : n < 10
+      ? `$${n.toFixed(4)}`
+      : `$${Math.round(n).toLocaleString('en-US')}`;
+
+const pct = (n) =>
+  n === null || n === undefined || !Number.isFinite(n) ? '—' : `${n >= 0 ? '+' : ''}${n.toFixed(1)}%`;
+
+const num = (n, d = 1) =>
+  n === null || n === undefined || !Number.isFinite(n) ? '—' : n.toFixed(d);
+
+/** Colour by how far the pool has fallen. Semantic, not decorative. */
+function tone(change) {
+  if (change === null || change === undefined) return 'gray';
+  if (change <= -90) return 'red';
+  if (change <= -50) return 'yellow';
+  return change < 0 ? 'white' : 'green';
 }
+
+/** One block character per sighting. Blank when too few points to be honest. */
+function sparkline(series, width = 12, minPoints = 4) {
+  const pts = series.filter((p) => Number.isFinite(p.liq));
+  if (pts.length < minPoints) return '';
+  const step = pts.length <= width ? 1 : (pts.length - 1) / (width - 1);
+  const sampled =
+    pts.length <= width
+      ? pts
+      : Array.from({ length: width }, (_, i) => pts[Math.round(i * step)]);
+  const vals = sampled.map((p) => p.liq);
+  const lo = Math.min(...vals);
+  const span = Math.max(...vals) - lo;
+  if (span === 0) return '▄'.repeat(sampled.length);
+  return sampled
+    .map((p) => BLOCKS[Math.min(7, Math.floor(((p.liq - lo) / span) * BLOCKS.length))])
+    .join('');
+}
+
+/* -------------------------------------------------------------------- cells */
+
+/**
+ * Fit a column set into the available width, dropping the lowest-priority
+ * columns first.
+ *
+ * Hard-coding widths that sum past the terminal is what produced the original
+ * mess: Ink will truncate a cell's text, but it cannot create horizontal space,
+ * so the row wraps and the layout comes apart anyway. Budgeting the columns is
+ * the only fix that holds at any width.
+ *
+ * @param {readonly {key:string,w:number,keep?:number}[]} cols
+ * @param {number} budget printable columns available
+ */
+export function fitColumns(cols, budget) {
+  const ordered = [...cols].sort((a, b) => (b.keep ?? 0) - (a.keep ?? 0));
+  const chosen = [];
+  let used = 0;
+  for (const c of ordered) {
+    if (used + c.w > budget) continue;
+    chosen.push(c);
+    used += c.w;
+  }
+  // Restore the author's column order; priority only decided what survived.
+  return cols.filter((c) => chosen.includes(c));
+}
+
+
+/** A fixed-width cell. Ink truncates, so no manual width arithmetic. */
+const Cell = ({ w, children, ...rest }) =>
+  h(Box, { width: w, flexShrink: 0 }, h(Text, { wrap: 'truncate', ...rest }, children));
+
+const Head = ({ w, children }) =>
+  h(Cell, { w, dimColor: true, bold: true }, children);
 
 /* -------------------------------------------------------------------- views */
 
-function headerLines(state) {
-  const { snap, ticks } = state;
-  const ageS = snap.snapshotAgeMs === null ? null : Math.round(snap.snapshotAgeMs / MS_PER_SECOND);
-  const healthy = isRecorderHealthy(snap.snapshotAgeMs, RECORDER.snapshotIntervalSeconds);
-  const spanH = ticks.length > 1 ? (ticks[ticks.length - 1].ts - ticks[0].ts) / MS_PER_HOUR : 0;
+function ActivityStrip({ ticks, width }) {
+  if (ticks.length === 0) return null;
+  const w = Math.max(10, width);
+  const step = ticks.length <= w ? 1 : (ticks.length - 1) / (w - 1);
+  const sampled =
+    ticks.length <= w ? ticks : Array.from({ length: w }, (_, i) => ticks[Math.round(i * step)]);
+  const max = Math.max(1, ...sampled.map((t) => t.seen));
+  const hits = ticks.filter((t) => t.safe > 0).length;
+  const spanH =
+    ticks.length > 1 ? (ticks[ticks.length - 1].ts - ticks[0].ts) / 3_600_000 : 0;
 
-  const status = healthy
-    ? `${ANSI.green}recording${ANSI.reset} ${ANSI.grey}(last snapshot ${ageS}s ago)${ANSI.reset}`
-    : ageS === null
-      ? `${ANSI.red}NO RECORDING${ANSI.reset} ${ANSI.grey}- run: npm run start${ANSI.reset}`
-      : `${ANSI.red}RECORDER STALE${ANSI.reset} ${ANSI.grey}(${ageS}s since last snapshot; ` +
-        `expected every ${RECORDER.snapshotIntervalSeconds}s - this screen is FROZEN, ` +
-        `not calm)${ANSI.reset}`;
-
-  const tabs = VIEWS.map((v, i) =>
-    v === state.view
-      ? `${ANSI.bold}${ANSI.cyan}[${i + 1}] ${v.toUpperCase()}${ANSI.reset}`
-      : `${ANSI.grey}[${i + 1}] ${v}${ANSI.reset}`,
-  ).join('  ');
-
-  return [
-    `${ANSI.bold}SOLSCALP${ANSI.reset}  ${status}   ${ANSI.grey}` +
-      `${ticks.length} scans over ${spanH.toFixed(1)}h${ANSI.reset}`,
-    `${tabs}   ${ANSI.grey}[q] quit  paper only, nothing here can sign${ANSI.reset}`,
-  ];
-}
-
-function liveView(state, cols, rows) {
-  const { snap, ticks } = state;
-  const at = state.now;
-  const withHits = ticks.filter((t) => t.safe > 0).length;
-
-  const lines = [
-    `${ANSI.grey}scan activity${ANSI.reset}  ${activityStrip(ticks, Math.max(20, cols - 30))}`,
-    `${ANSI.grey}${ticks.length} scans, ${withHits} found something the gate passed` +
-      `   profile ${snap.profile ?? '?'}${ANSI.reset}`,
-    '',
-  ];
-
-  if (ticks.length === 0) {
-    // Nothing has ever scanned. Saying "the filter is working" here would be a
-    // lie of exactly the kind this project exists to avoid: an empty screen
-    // because nothing ran is not an empty screen because nothing qualified.
-    lines.push(`${ANSI.yellow}Nothing has been recorded yet.${ANSI.reset}`);
-    lines.push('');
-    lines.push(`${ANSI.grey}This screen only shows what the recorder wrote, and the recorder has${ANSI.reset}`);
-    lines.push(`${ANSI.grey}not written anything. That is not a quiet market -- it is no data.${ANSI.reset}`);
-    lines.push('');
-    lines.push(`${ANSI.bold}Start it with:  npm run start${ANSI.reset}`);
-    return pane({ title: 'LAST SCAN', lines, cols, rows });
-  }
-
-  if (snap.candidates.length === 0) {
-    lines.push(`${ANSI.grey}The last scan saw nothing that cleared the universe screen.${ANSI.reset}`);
-    lines.push(`${ANSI.grey}98.6% of these tokens are rugs or under $1k liquidity, so an empty${ANSI.reset}`);
-    lines.push(`${ANSI.grey}scan is the filter working. The strip above is the proof it is running.${ANSI.reset}`);
-    return pane({ title: 'LAST SCAN', lines, cols, rows });
-  }
-
-  lines.push(
-    `${ANSI.grey}${pad('TOKEN', 11)}${pad('MCAP', 10)}${pad('LIQ', 10)}${pad('5m', 8)}` +
-      `${pad('1h', 9)}${pad('B/S', 6)}${pad('ACC', 6)}${pad('SEEN', 6)}${pad('SAFE?', 22)}` +
-      `ENTER?${ANSI.reset}`,
+  return h(
+    Box,
+    { flexDirection: 'column' },
+    h(
+      Text,
+      null,
+      sampled.map((t, i) =>
+        h(
+          Text,
+          { key: i, color: t.safe > 0 ? 'green' : t.seen > 0 ? 'cyan' : 'gray' },
+          t.seen === 0 ? '·' : BLOCKS[Math.min(7, Math.floor((t.seen / max) * BLOCKS.length))],
+        ),
+      ),
+    ),
+    h(
+      Text,
+      { dimColor: true },
+      `${ticks.length} scans over ${spanH.toFixed(1)}h · ${hits} found something the gate passed`,
+    ),
   );
-
-  for (const c of snap.candidates) {
-    const pair = snap.pairs.find((p) => p.mint === c.mint);
-    const s = pair ? readSignals(pair, at) : {};
-    const row = state.rows.find((r) => r.mint === c.mint);
-    const gate = snap.gateResults[c.mint];
-    const safe = gate?.buyable
-      ? `${ANSI.green}SAFE${ANSI.reset}`
-      : `${ANSI.red}blocked${ANSI.reset} ${ANSI.grey}${(gate?.rejectedBy?.[0] ?? gate?.erroredIn?.[0] ?? '').slice(0, 13)}${ANSI.reset}`;
-    // The entry decision is a SEPARATE question from safety, and collapsing the
-    // two is the most expensive misreading available here.
-    const enter = !gate?.buyable
-      ? `${ANSI.grey}-${ANSI.reset}`
-      : (c.wouldEnter ?? false)
-        ? `${ANSI.bold}${ANSI.green}YES${ANSI.reset}`
-        : `${ANSI.grey}no${ANSI.reset}`;
-    lines.push(
-      pad((c.symbol ?? '?').slice(0, 10), 11) +
-        pad(usd(s.marketCapUsd ?? c.marketCapUsd), 10) +
-        pad(usd(s.liquidityUsd ?? c.liquidityUsd), 10) +
-        pad(pct(c.priceChangeM5Pct), 8) +
-        pad(pct(c.priceChangeH1Pct), 9) +
-        pad(c.buySellRatioM5 === null ? 'n/a' : c.buySellRatioM5.toFixed(1), 6) +
-        pad(c.volumeAccelerationRatio === null ? 'n/a' : c.volumeAccelerationRatio.toFixed(1), 6) +
-        pad(String(row?.seen ?? 1), 6) +
-        pad(safe, 22) +
-        enter,
-    );
-  }
-  return pane({
-    title: 'LAST SCAN',
-    lines,
-    cols,
-    rows,
-    note: 'SAFE? = gate   ENTER? = momentum rules',
-  });
 }
 
-function historyView(state, cols, rows) {
-  // Every token ever recorded, worst first. The trace is real: one point per
-  // sighting, which is why it is evidence rather than decoration.
-  const enriched = state.rows
-    .map((r) => {
-      const lastLiq = [...r.series].reverse().find((p) => typeof p.liq === 'number')?.liq ?? null;
-      // The labeller re-fetched to decide; its measurement is the honest "now".
-      // The recording's own tail is not: the recorder stops observing a token the
-      // moment it falls out of the screen, so its last value is the last HEALTHY
-      // reading rather than the outcome.
-      const measured = r.labelEvidence?.liquidityAfterUsd ?? null;
-      const nowLiq = measured ?? lastLiq;
-      const change =
-        r.entryLiquidityUsd && nowLiq !== null && r.entryLiquidityUsd > 0
-          ? ((nowLiq - r.entryLiquidityUsd) / r.entryLiquidityUsd) * 100
-          : null;
-      return { ...r, nowLiq, change, measured: measured !== null };
-    })
-    .sort((a, b) => (a.change ?? 0) - (b.change ?? 0));
+function LiveView({ data, width }) {
+  if (data.ticks.length === 0) {
+    return h(
+      Box,
+      { flexDirection: 'column' },
+      h(Text, { color: 'yellow', bold: true }, 'Nothing has been recorded yet.'),
+      h(Text, null, ''),
+      h(
+        Text,
+        { dimColor: true, wrap: 'wrap' },
+        'This screen only shows what the recorder wrote, and it has written nothing. ' +
+          'That is not a quiet market — it is no data.',
+      ),
+      h(Text, null, ''),
+      h(Text, { bold: true }, 'Start it with:  npm run start'),
+    );
+  }
 
-  const lines = [
-    `${ANSI.grey}${pad('TOKEN', 11)}${pad('LIQ@ENTRY', 11)}${pad('LATEST', 11)}${pad('CHANGE', 9)}` +
-      `${pad('TRACE', 14)}${pad('SEEN', 6)}${pad('AGE', 6)}${pad('GATE', 9)}OUTCOME${ANSI.reset}`,
+  return h(
+    Box,
+    { flexDirection: 'column' },
+    h(ActivityStrip, { ticks: data.ticks, width: width - 5 }),
+    h(Text, null, ''),
+    data.lastScan.length === 0
+      ? h(
+          Text,
+          { dimColor: true, wrap: 'wrap' },
+          'The last scan saw nothing that cleared the universe screen. 98.6% of these ' +
+            'tokens are rugs or under $1k liquidity, so an empty scan is the filter ' +
+            'working — the strip above is the proof it is running.',
+        )
+      : h(
+          Box,
+          { flexDirection: 'column' },
+          (() => {
+            const cols = fitColumns(
+              [
+                { key: 'sym', w: 11, keep: 9, head: 'TOKEN', cell: (c) => [(c.symbol ?? '?').slice(0, 9), { bold: true }] },
+                { key: 'safe', w: 9, keep: 8, head: 'SAFE?', cell: (c) => [c.gateBuyable ? 'SAFE' : 'blocked', { color: c.gateBuyable ? 'green' : 'red' }] },
+                { key: 'enter', w: 7, keep: 8, head: 'ENTER?', cell: (c) => (c.gateBuyable ? [c.wouldEnter ? 'ENTER' : 'no', { color: c.wouldEnter ? 'green' : 'gray', bold: Boolean(c.wouldEnter) }] : ['—', { dimColor: true }]) },
+                { key: 'mcap', w: 10, keep: 7, head: 'MCAP', cell: (c) => [usd(c.marketCapUsd), {}] },
+                { key: 'liq', w: 10, keep: 6, head: 'LIQ', cell: (c) => [usd(c.liquidityUsd), {}] },
+                { key: 'm5', w: 8, keep: 5, head: '5m', cell: (c) => [pct(c.priceChangeM5Pct), { color: (c.priceChangeM5Pct ?? 0) >= 0 ? 'green' : 'red' }] },
+                { key: 'h1', w: 9, keep: 4, head: '1h', cell: (c) => [pct(c.priceChangeH1Pct), { color: (c.priceChangeH1Pct ?? 0) >= 0 ? 'green' : 'red' }] },
+                { key: 'acc', w: 6, keep: 3, head: 'ACC', cell: (c) => [num(c.volumeAccelerationRatio, 1), {}] },
+                { key: 'bs', w: 6, keep: 2, head: 'B/S', cell: (c) => [num(c.buySellRatioM5, 1), {}] },
+                { key: 'age', w: 6, keep: 1, head: 'AGE', cell: (c) => [c.ageMinutes === null ? '—' : Math.round(c.ageMinutes) + 'm', {}] },
+              ],
+              width,
+            );
+            return h(
+              Box,
+              { flexDirection: 'column' },
+              h(Box, null, ...cols.map((col) => h(Head, { key: col.key, w: col.w }, col.head))),
+              ...data.lastScan.map((c) =>
+                h(
+                  Box,
+                  { key: c.mint },
+                  ...cols.map((col) => {
+                    const [text, props] = col.cell(c);
+                    return h(Cell, { key: col.key, w: col.w, ...props }, String(text));
+                  }),
+                ),
+              ),
+            );
+          })(),
+          h(Text, null, ''),
+          h(
+            Text,
+            { dimColor: true, wrap: 'wrap' },
+            'SAFE? is the gate — the creator probably cannot steal your tokens. ENTER? is ' +
+              'the momentum rules. Different questions: most tokens are one without the other, ' +
+              'and a soft rug passes every safety check.',
+          ),
+        ),
+  );
+}
+
+function HistoryView({ data, rows, width }) {
+  if (data.history.length === 0) {
+    return h(Text, { dimColor: true }, 'Nothing recorded yet.');
+  }
+  const visible = data.history.slice(0, Math.max(3, rows - 9));
+  const cols = fitColumns(
+    [
+      { key: 'sym', w: 11, keep: 9, head: 'TOKEN', cell: (r) => [(r.symbol ?? '?').slice(0, 9), { bold: true }] },
+      { key: 'chg', w: 9, keep: 8, head: 'CHANGE', cell: (r) => [pct(r.changePct), { color: tone(r.changePct), bold: true }] },
+      { key: 'trace', w: 13, keep: 7, head: 'TRACE', cell: (r) => [sparkline(r.series, 12), { color: tone(r.changePct) }] },
+      { key: 'entry', w: 10, keep: 6, head: 'AT ENTRY', cell: (r) => [usd(r.entryLiquidityUsd), {}] },
+      { key: 'now', w: 11, keep: 5, head: 'LATEST', cell: (r) => [usd(r.nowLiquidityUsd) + (r.measured ? '' : '~'), {}] },
+      { key: 'label', w: 11, keep: 4, head: 'OUTCOME', cell: (r) => [r.label ?? 'unlabelled', { color: r.label === data.config.RUGGED ? 'red' : r.label === data.config.SURVIVED ? 'green' : 'gray' }] },
+      { key: 'gate', w: 8, keep: 3, head: 'GATE', cell: (r) => [r.gateBuyable ? 'passed' : 'blocked', { color: r.gateBuyable ? 'green' : 'gray' }] },
+      { key: 'seen', w: 6, keep: 2, head: 'SEEN', cell: (r) => [String(r.seen), {}] },
+      { key: 'age', w: 5, keep: 1, head: 'AGE', cell: (r) => [r.ageHours.toFixed(0) + 'h', {}] },
+    ],
+    width,
+  );
+  return h(
+    Box,
+    { flexDirection: 'column' },
+    h(Box, null, ...cols.map((col) => h(Head, { key: col.key, w: col.w }, col.head))),
+    ...visible.map((r) =>
+      h(
+        Box,
+        { key: r.mint },
+        ...cols.map((col) => {
+          const [text, props] = col.cell(r);
+          return h(Cell, { key: col.key, w: col.w, ...props }, String(text));
+        }),
+      ),
+    ),
+    h(Text, null, ''),
+    h(
+      Text,
+      { dimColor: true, wrap: 'wrap' },
+      `${data.history.length} tokens recorded${visible.length < data.history.length ? `, showing ${visible.length}` : ''}. ` +
+        'AT ENTRY is the first sighting. A ~ on LATEST means it is the last recorded value, ' +
+        'not re-measured — that runs high, because the recorder stops watching a token the ' +
+        'moment it drops out of the screen. Each TRACE block is one real sighting.',
+    ),
+  );
+}
+
+function EvidenceView({ data }) {
+  const { tally, report, baseRatePct, minSample } = data.evidence;
+  const rows = [
+    ['snapshots recorded', String(tally.snapshots)],
+    ['unique mints seen', String(tally.uniqueMints)],
+    ['gate approved', String(tally.approved + tally.unlabelled)],
+    ['  of those, labelled', String(tally.approved)],
+    ['  still unlabelled', `${tally.unlabelled}   (counted as UNKNOWN, never as survived)`],
+    ['gate blocked', String(tally.rejected)],
+    ['  of those, labelled', `${tally.blockedLabelled}, rugged ${tally.blockedRugged}`],
   ];
-  for (const r of enriched) {
-    const label = r.storedLabel ?? '';
-    const tone =
-      label === LABEL.RUGGED ? ANSI.red : label === LABEL.SURVIVED ? ANSI.green : ANSI.grey;
-    lines.push(
-      pad((r.symbol ?? '?').slice(0, 10), 11) +
-        pad(usd(r.entryLiquidityUsd), 11) +
-        pad(usd(r.nowLiq) + (r.measured ? '' : `${ANSI.grey}~${ANSI.reset}`), 11) +
-        pad(r.change === null ? 'n/a' : pct(r.change), 9) +
-        pad(sparkline(r.series, 12), 14) +
-        pad(String(r.seen), 6) +
-        pad(`${((state.now - r.firstTs) / MS_PER_HOUR).toFixed(0)}h`, 6) +
-        pad(r.gateBuyable ? `${ANSI.green}passed${ANSI.reset}` : `${ANSI.grey}blocked${ANSI.reset}`, 9) +
-        `${tone}${label || 'unlabelled'}${ANSI.reset}`,
-    );
-  }
-  return pane({
-    title: `HISTORY - ${enriched.length} tokens ever recorded`,
-    lines,
-    cols,
-    rows,
-    note: '~ = last recorded, not re-measured',
-  });
+
+  return h(
+    Box,
+    { flexDirection: 'column' },
+    h(
+      Text,
+      { wrap: 'wrap' },
+      h(Text, { bold: true }, 'The question: '),
+      'of the tokens the gate approved, what fraction later rugged — against the ',
+      h(Text, { bold: true }, `${baseRatePct}%`),
+      ' population base rate?',
+    ),
+    h(Text, null, ''),
+    ...rows.map(([k, v], i) =>
+      h(Box, { key: i }, h(Cell, { w: 24, dimColor: true }, k), h(Text, null, v)),
+    ),
+    h(Text, null, ''),
+    report.sufficient
+      ? h(
+          Box,
+          { flexDirection: 'column' },
+          h(
+            Text,
+            { bold: true },
+            `approved-and-rugged  ${report.rugged}/${report.approved} = ${report.ruggedPct.toFixed(1)}%`,
+          ),
+          h(
+            Text,
+            null,
+            `95% interval  ${report.interval.low.toFixed(1)}% .. ${report.interval.high.toFixed(1)}%` +
+              `   lift ${report.liftPctPoints.toFixed(1)} points`,
+          ),
+          h(Text, null, ''),
+          tally.blockedLabelled >= minSample
+            ? h(
+                Text,
+                {
+                  wrap: 'wrap',
+                  color:
+                    (tally.blockedRugged / tally.blockedLabelled) * 100 - report.ruggedPct <= 0
+                      ? 'red'
+                      : 'green',
+                },
+                `Control: what it REJECTED rugged at ` +
+                  `${((tally.blockedRugged / tally.blockedLabelled) * 100).toFixed(1)}%. ` +
+                  ((tally.blockedRugged / tally.blockedLabelled) * 100 - report.ruggedPct <= 0
+                    ? 'The gate is NOT discriminating — it blocked a cohort no dirtier than the one it passed.'
+                    : 'The gate blocked a dirtier cohort than it passed, which is what working looks like.'),
+              )
+            : h(
+                Text,
+                { dimColor: true, wrap: 'wrap' },
+                `No control comparison yet: ${tally.blockedLabelled} labelled rejects, ${minSample} needed. ` +
+                  'Beating the base rate alone cannot show the gate discriminates between tokens ' +
+                  'rather than just discarding them.',
+              ),
+        )
+      : h(
+          Box,
+          { flexDirection: 'column' },
+          h(Text, { color: 'yellow', bold: true }, 'No rate reported'),
+          h(Text, { dimColor: true, wrap: 'wrap' }, report.reason ?? ''),
+          h(Text, null, ''),
+          h(
+            Text,
+            { dimColor: true, wrap: 'wrap' },
+            `Labelling runs automatically every ${data.config.autoLabelEveryMinutes} minutes, and a ` +
+              `token needs ${data.config.minAgeHoursBeforeLabelling}h before its outcome means anything. ` +
+              'This is the slow part and it cannot be rushed: the dataset cannot be reconstructed ' +
+              'after the fact.',
+          ),
+        ),
+  );
 }
 
-function evidenceView(state, cols, rows) {
-  const tally = tallyRecords(state.lines);
-  const report = scoreRugFilter(tally);
-  const lines = [
-    `${ANSI.bold}THE QUESTION${ANSI.reset} ${ANSI.grey}of the tokens the gate APPROVED,` +
-      ` what fraction later rugged?${ANSI.reset}`,
-    '',
-    `  snapshots recorded   ${tally.snapshots}`,
-    `  unique mints seen    ${tally.uniqueMints}`,
-    `  gate approved        ${tally.approved + tally.unlabelled}`,
-    `    labelled           ${tally.approved}`,
-    `    ${ANSI.grey}still unlabelled   ${tally.unlabelled}  <- counted as UNKNOWN, never as survived${ANSI.reset}`,
-    `  gate blocked         ${tally.rejected}`,
-    `    ${ANSI.grey}labelled ${tally.blockedLabelled}, of those rugged ${tally.blockedRugged}${ANSI.reset}`,
-    '',
-  ];
+/* ---------------------------------------------------------------------- app */
 
-  if (!report.sufficient) {
-    lines.push(`${ANSI.yellow}NO RATE REPORTED${ANSI.reset}`);
-    lines.push(`  ${report.reason}`);
-    lines.push('');
-    lines.push(
-      `${ANSI.grey}  Labelling runs automatically every ${LABELS.autoLabelEveryMinutes} min; a token needs` +
-        ` ${LABELS.minAgeHoursBeforeLabelling}h before${ANSI.reset}`,
-    );
-    lines.push(`${ANSI.grey}  its outcome means anything. This is the slow part and cannot be rushed:${ANSI.reset}`);
-    lines.push(`${ANSI.grey}  the dataset cannot be reconstructed after the fact.${ANSI.reset}`);
-  } else {
-    lines.push(
-      `${ANSI.bold}  approved-and-rugged  ${report.rugged}/${report.approved} = ` +
-        `${report.ruggedPct.toFixed(1)}%${ANSI.reset}`,
-    );
-    lines.push(`  95% interval         ${report.interval.low.toFixed(1)}% .. ${report.interval.high.toFixed(1)}%`);
-    lines.push(`  population base rate ${BASE_RATE_PCT}%`);
-    lines.push(`  lift                 ${report.liftPctPoints.toFixed(1)} percentage points`);
-    lines.push('');
-    if (tally.blockedLabelled >= MIN_SAMPLE) {
-      const blockedPct = (tally.blockedRugged / tally.blockedLabelled) * 100;
-      const gap = blockedPct - report.ruggedPct;
-      lines.push(`${ANSI.bold}  CONTROL: rejected-and-rugged ${blockedPct.toFixed(1)}%${ANSI.reset}`);
-      lines.push(`  separation ${gap.toFixed(1)} points`);
-      lines.push(
-        gap <= 0
-          ? `${ANSI.red}  NOT DISCRIMINATING: what it blocked rugged no more often than what it passed.${ANSI.reset}`
-          : `${ANSI.green}  The gate blocked a dirtier cohort than it passed.${ANSI.reset}`,
-      );
-    } else {
-      lines.push(
-        `${ANSI.grey}  No control comparison yet: ${tally.blockedLabelled} labelled rejects, ` +
-          `${MIN_SAMPLE} needed. Beating the base rate alone cannot show it discriminates.${ANSI.reset}`,
-      );
-    }
-  }
-  return pane({ title: 'EVIDENCE', lines, cols, rows });
+function App({ dir, refreshMs, initialView }) {
+  const { exit } = useApp();
+  // Ink THROWS from useInput when the terminal has no raw mode -- which is the
+  // likely cause of 'the keys do nothing': not a bug in the handler, but a
+  // terminal that never delivers the keypress. Detect it and say so, rather than
+  // crashing or silently ignoring input.
+  const stdin = useStdin();
+  // Coerce to a REAL boolean. Ink defaults isActive to true, and a default
+  // parameter fires on `undefined` -- so passing the raw value through when it
+  // is undefined silently enables input and Ink then throws 'Raw mode is not
+  // supported'. isTTY is the source of truth; Ink's own flag was undefined here.
+  const canType = stdin.isRawModeSupported === true || process.stdin.isTTY === true;
+  const [view, setView] = useState(initialView);
+  const [data, setData] = useState(EMPTY);
+  const [error, setError] = useState(null);
+  const [reads, setReads] = useState(0);
+  const [nudge, setNudge] = useState(0);
+
+  const termCols = process.stdout.columns || 100;
+  // The bordered box costs 2 columns, paddingX:1 costs 2 more. Budget against
+  // what is actually left, not against the terminal width.
+  const inner = Math.max(28, termCols - 6);
+  const rows = process.stdout.rows || 30;
+
+  useEffect(() => {
+    let live = true;
+    const read = async () => {
+      try {
+        const next = await buildDashData({ dir, now: Date.now() });
+        if (!live) return;
+        setData(next);
+        setError(null);
+        setReads((n) => n + 1);
+      } catch (err) {
+        if (live) setError(err?.message ?? String(err));
+      }
+    };
+    read();
+    const timer = setInterval(read, refreshMs);
+    return () => {
+      live = false;
+      clearInterval(timer);
+    };
+  }, [dir, refreshMs, nudge]);
+
+  // Input is handled independently of the read timer, so a keypress is never
+  // waiting on anything.
+  useInput((input, key) => {
+    if (input === 'q' || key.escape || (key.ctrl && input === 'c')) exit();
+    else if (input === '1') setView(VIEWS[0]);
+    else if (input === '2') setView(VIEWS[1]);
+    else if (input === '3') setView(VIEWS[2]);
+    else if (input === 'r') setNudge((n) => n + 1);
+    else if (key.rightArrow || key.tab)
+      setView((v) => VIEWS[(VIEWS.indexOf(v) + 1) % VIEWS.length]);
+    else if (key.leftArrow)
+      setView((v) => VIEWS[(VIEWS.indexOf(v) + VIEWS.length - 1) % VIEWS.length]);
+  }, { isActive: canType });
+
+  const age =
+    data.recorder.snapshotAgeMs === null
+      ? null
+      : Math.round(data.recorder.snapshotAgeMs / MS_PER_SECOND);
+
+  const status = data.recorder.healthy
+    ? h(Text, { color: 'green' }, `recording · last snapshot ${age}s ago`)
+    : age === null
+      ? h(Text, { color: 'red', bold: true }, 'NO RECORDING — run: npm run start')
+      : h(
+          Text,
+          { color: 'red', bold: true },
+          `RECORDER STALE — ${age}s since last snapshot (expected every ` +
+            `${data.recorder.expectedEverySeconds}s). This screen is FROZEN, not calm.`,
+        );
+
+  return h(
+    Box,
+    { flexDirection: 'column', width: inner },
+    h(
+      Box,
+      { gap: 2 },
+      h(Text, { bold: true }, 'SOLSCALP'),
+      status,
+      h(Text, { dimColor: true }, `profile ${data.recorder.profile ?? '?'}`),
+    ),
+    h(
+      Box,
+      { gap: 2, marginTop: 1 },
+      ...VIEWS.map((v, i) =>
+        h(
+          Text,
+          {
+            key: v,
+            bold: v === view,
+            color: v === view ? 'cyan' : undefined,
+            dimColor: v !== view,
+          },
+          `${i + 1} ${v.toUpperCase()}`,
+        ),
+      ),
+      canType
+        ? h(Text, { dimColor: true }, '· ←/→ switch · r reload · q quit')
+        : h(
+            Text,
+            { color: 'yellow' },
+            '· no keys here: use --view',
+          ),
+    ),
+    h(
+      Box,
+      {
+        borderStyle: 'round',
+        borderDimColor: true,
+        flexDirection: 'column',
+        paddingX: 1,
+        marginTop: 1,
+        width: termCols,
+      },
+      error !== null
+        ? h(Text, { color: 'red', wrap: 'wrap' }, `read failed: ${error}`)
+        : view === 'history'
+          ? h(HistoryView, { data, rows, width: inner })
+          : view === 'evidence'
+            ? h(EvidenceView, { data })
+            : h(LiveView, { data, width: inner }),
+    ),
+    h(
+      Box,
+      { gap: 2 },
+      h(
+        Text,
+        { dimColor: true },
+        `book ${usd(data.config.bookSizeUsd)} · position ${usd(data.config.positionSizeUsd)} · ` +
+          `mcap ${usd(data.config.minMarketCapUsd)}–${usd(data.config.maxMarketCapUsd)} · ` +
+          `paper only · reads ${reads}`,
+      ),
+    ),
+  );
 }
 
-function footerLines(state, cols) {
-  const book = `${ANSI.grey}book ${usd(RISK.bookSizeUsd)}  position ${usd(RISK.positionSizeUsd)}  ` +
-    `mcap ${usd(STRATEGY.universe.minMarketCapUsd)}-${usd(STRATEGY.universe.maxMarketCapUsd)}${ANSI.reset}`;
-  return [pad(book, cols)];
-}
-
-function render(state) {
-  const { cols, rows } = size();
-  const header = headerLines(state);
-  const footer = footerLines(state, cols);
-  const body = Math.max(6, rows - HEADER_ROWS - footer.length - 1);
-  const view =
-    state.view === 'history'
-      ? historyView(state, cols, body)
-      : state.view === 'evidence'
-        ? evidenceView(state, cols, body)
-        : liveView(state, cols, body);
-  paint([...header, ...view, ...footer]);
-}
-
-/* -------------------------------------------------------------------- main */
+/* --------------------------------------------------------------------- main */
 
 /**
  * @param {readonly string[]} argv
- * @param {object} [injected]
+ * @param {object} [deps]
  * @returns {Promise<number>}
  */
-export async function main(argv, injected = {}) {
+export async function main(argv, deps = {}) {
   const { flags } = parseArgs(argv);
+  const out = deps.out ?? console.log;
   if (flags.help === true) {
-    (injected.out ?? console.log)(USAGE);
+    out(USAGE);
     return EXIT.OK;
   }
+
   const dir = typeof flags.dir === 'string' ? flags.dir : RECORDER.dir;
-  const refreshMs = intFlag(flags.refresh, 5) * MS_PER_SECOND;
-  const now = injected.now ?? Date.now;
-  const sleep = injected.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
-  const maxCycles = flags.cycles === undefined ? Infinity : intFlag(flags.cycles, 1);
+  const refreshMs = intFlag(flags.refresh, 3) * MS_PER_SECOND;
+  const initialView = VIEWS.includes(flags.view) ? flags.view : VIEWS[0];
 
-  // --view picks the starting pane, so a view can be scripted or captured without
-  // keystrokes (and so this screen is testable at all).
-  let view = VIEWS.includes(flags.view) ? flags.view : VIEWS[0];
-  let running = true;
-
-  // Raw mode so a single keypress switches view without waiting for Enter.
-  const stdin = injected.stdin ?? process.stdin;
-  const interactive = typeof stdin.setRawMode === 'function' && stdin.isTTY;
-  if (interactive) {
-    stdin.setRawMode(true);
-    stdin.resume();
-    stdin.setEncoding('utf8');
-    stdin.on('data', (key) => {
-      if (key === 'q' || key === '') running = false;
-      else if (key === '1') view = VIEWS[0];
-      else if (key === '2') view = VIEWS[1];
-      else if (key === '3') view = VIEWS[2];
-    });
+  // --once renders a single frame and exits: the only way this screen is
+  // testable, and useful for a quick look without taking over the terminal.
+  if (flags.once === true) {
+    const { buildDashData: build } = await import('./lib/dashData.js');
+    const data = await build({ dir, now: Date.now() });
+    const app = render(
+      h(Box, { flexDirection: 'column' }, h(App, { dir, refreshMs: 1e9, initialView })),
+      { patchConsole: false },
+    );
+    await new Promise((r) => setTimeout(r, 250));
+    app.unmount();
+    void data;
+    return EXIT.OK;
   }
 
-  await withScreen(async () => {
-    let cycles = 0;
-    while (running && cycles < maxCycles) {
-      const at = now();
-      let state;
-      try {
-        state = { ...(await readState({ dir, now: at }, injected)), view, now: at };
-      } catch (err) {
-        state = {
-          files: [], lines: [], rows: [], ticks: [],
-          snap: { snapshotAgeMs: null, candidates: [], pairs: [], gateResults: {}, profile: null },
-          view, now: at, error: err?.message ?? String(err),
-        };
-      }
-      render(state);
-      cycles += 1;
-      if (running && cycles < maxCycles) {
-        // Poll in slices so a keypress is felt immediately rather than after a
-        // whole refresh interval.
-        for (let waited = 0; waited < refreshMs && running; waited += 120) {
-          await sleep(Math.min(120, refreshMs - waited));
-        }
-      }
-    }
-  });
-
-  if (interactive) {
-    stdin.setRawMode(false);
-    stdin.pause();
-  }
+  const app = render(h(App, { dir, refreshMs, initialView }));
+  await app.waitUntilExit();
   return EXIT.OK;
 }
 

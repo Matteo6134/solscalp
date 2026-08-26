@@ -38,7 +38,7 @@ export const size = (stream = process.stdout) =>
 /** Printable length, ignoring ANSI escapes, so padding maths stays correct. */
 export const visibleLength = (text) => stripAnsi(text).length;
 
-export const stripAnsi = (text) => String(text).replace(/\[[0-9;]*m/g, '');
+export const stripAnsi = (text) => String(text).replace(/\[[0-9;?]*[A-Za-z]/g, '');
 
 /** Clip to `width` printable characters. Escapes are preserved but not counted. */
 export function clip(text, width) {
@@ -50,7 +50,7 @@ export function clip(text, width) {
   let seen = 0;
   let i = 0;
   while (i < s.length && seen < width - 1) {
-    const esc = /^\[[0-9;]*m/.exec(s.slice(i));
+    const esc = /^\[[0-9;?]*[A-Za-z]/.exec(s.slice(i));
     if (esc) {
       out += esc[0];
       i += esc[0].length;
@@ -94,9 +94,28 @@ export function pane({ title, lines, cols, rows, note = '' }) {
   return [bar, ...body];
 }
 
-/** Repaint the whole screen from a list of lines. One write, so no tearing. */
+/**
+ * Repaint the whole screen from a list of lines. One write, so no tearing.
+ *
+ * EVERY LINE IS CLIPPED TO THE TERMINAL WIDTH, AND THAT IS LOAD-BEARING.
+ *   A line one character too long wraps, which pushes every line below it down
+ *   by one. The trailing erase-to-end then cannot repair the damage, because the
+ *   content it would have erased has been shoved into rows that are still in
+ *   use. The visible result is a screen of text sitting on top of itself.
+ *
+ *   Panes already clip their own body, but the header and footer did not go
+ *   through a pane -- measured at 81 and 86 characters on an 80-column terminal.
+ *   Clipping here instead of at each call site means no future caller can
+ *   reintroduce it.
+ *
+ * Also clips the row COUNT: writing more lines than the terminal has rows
+ * scrolls the top away, which loses the header that says whether the recorder
+ * is alive.
+ */
 export function paint(lines, stream = process.stdout) {
-  stream.write(ANSI.home + lines.join('\n') + ANSI.clear.replace('2J', '0J'));
+  const { cols, rows } = size(stream);
+  const fitted = lines.slice(0, rows - 1).map((l) => clip(l, cols));
+  stream.write(ANSI.home + fitted.join('\n') + ANSI.clear.replace('2J', '0J'));
 }
 
 /**

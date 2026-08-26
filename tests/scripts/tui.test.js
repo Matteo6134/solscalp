@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ANSI, clip, pad, pane, ring, size, stripAnsi, visibleLength } from '../../scripts/lib/tui.js';
+import { ANSI, clip, pad, paint, pane, ring, size, stripAnsi, visibleLength } from '../../scripts/lib/tui.js';
 
 describe('visibleLength / stripAnsi', () => {
   it('ignores escape sequences when measuring', () => {
@@ -125,5 +125,54 @@ describe('ring', () => {
 
   it('is empty until pushed', () => {
     expect(ring(5).all()).toEqual([]);
+  });
+});
+
+describe('paint -- the overlap bug', () => {
+  /**
+   * A line one character too long wraps, pushing every line below it down by
+   * one, and the trailing erase cannot repair that because the content has been
+   * shoved into rows still in use. The visible result is text on top of itself.
+   * Measured before the fix: the dash header was 81 chars and the footer 86 on
+   * an 80-column terminal.
+   */
+  const fakeStream = (cols, rows) => {
+    const writes = [];
+    return { columns: cols, rows, write: (s) => writes.push(s), writes };
+  };
+
+  it('clips every line to the terminal width', () => {
+    const s = fakeStream(40, 20);
+    paint(['x'.repeat(100), 'short'], s);
+    const body = s.writes.join('');
+    for (const l of stripAnsi(body).split('\n')) {
+      expect(l.length).toBeLessThanOrEqual(40);
+    }
+  });
+
+  it('clips coloured lines by PRINTABLE width, not byte length', () => {
+    const s = fakeStream(30, 20);
+    paint([`${ANSI.green}${'y'.repeat(80)}${ANSI.reset}`], s);
+    const line = s.writes.join('').split('\n')[0];
+    expect(visibleLength(line.replace(/\x1b\[H|\x1b\[0J/g, ''))).toBeLessThanOrEqual(30);
+  });
+
+  it('never writes more rows than the terminal has', () => {
+    const s = fakeStream(40, 10);
+    paint(Array.from({ length: 50 }, (_, i) => `line ${i}`), s);
+    const rendered = stripAnsi(s.writes.join('')).split('\n');
+    // one row is reserved so the last line does not scroll the header away
+    expect(rendered.length).toBeLessThanOrEqual(10);
+  });
+
+  it('still emits an erase-to-end so shorter frames leave no residue', () => {
+    const s = fakeStream(40, 20);
+    paint(['a'], s);
+    expect(s.writes.join('')).toContain('[0J');
+  });
+
+  it('falls back to sane dimensions for a stream with none', () => {
+    const s = { write: (x) => x };
+    expect(() => paint(['a'], s)).not.toThrow();
   });
 });
