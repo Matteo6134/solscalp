@@ -1,344 +1,319 @@
 #!/usr/bin/env node
 /**
- * Live dashboard -- everything on one screen, refreshing.
+ * The one screen. Reads the recording; never fetches.
  *
- * Replaces keeping four terminals open: one loop does the enumerate -> screen ->
- * gate -> price -> decide cycle once per interval and repaints four panes.
+ * WHY IT READS INSTEAD OF SCANNING
+ *   This used to run its own enumerate -> screen -> gate cycle. That made it a
+ *   third process competing for the same per-IP rate limits as the recorder and
+ *   the bot, and the limiters live inside each process and cannot see each other,
+ *   so they starved one another until the loser spent every cycle reporting 429s.
  *
- * THE TWO COLUMNS THAT MATTER, AND WHY THEY ARE SEPARATE
- *   SAFE?  -- the safety gate passed: the creator probably cannot steal from you.
- *   ENTER? -- the momentum rules fired: the strategy would actually buy.
- *   A token is usually one without the other. Collapsing them into a single
- *   "BUYABLE" invites reading a safety result as a trade signal, which is the
- *   most expensive misreading this project could encourage.
+ *   Reading the recorder's append-only JSONL instead fixes three things at once:
+ *     - it costs NOTHING upstream, so it is safe to leave open forever;
+ *     - it has HISTORY, because the recording is the history -- hours of ticks
+ *       and every sighting of every token, not just this instant;
+ *     - it REMEMBERS, because a restart re-reads the file. Nothing is lost by
+ *       closing the window, which was not true of the in-memory version.
  *
- * PAPER ONLY. No keypair exists in this repo; the positions pane is a ledger of
- * hypotheticals and nothing here can sign a transaction.
+ * WHAT IT CANNOT DO
+ *   It cannot see anything the recorder did not record. If the recorder stops,
+ *   this screen freezes at the last snapshot -- so the header always shows the
+ *   snapshot's AGE and turns red when it goes stale. A dashboard that looks calm
+ *   while its source of truth is dead is worse than no dashboard.
+ *
+ * Views: [1] LIVE  [2] HISTORY  [3] EVIDENCE.  q or Ctrl+C to quit.
  */
 
-import pLimit from 'p-limit';
-import { MODES, RISK, SAFETY, STRATEGY, UNIVERSE_PROFILES } from '../src/config.js';
-import { getBestPairs } from '../src/data/dexscreener.js';
-import { getNewPools, getTopPools, getTrendingPools } from '../src/data/geckoterminal.js';
-import { loadEnv } from '../src/env.js';
-import { createEngineState, readSignals, stepEngine, universeReasons } from '../src/paper/engine.js';
-import { emptyPortfolio, portfolioEquityUsd } from '../src/paper/portfolio.js';
-import { recheckGate, runGate } from '../src/safety/index.js';
-import { EXIT, buildRpc, intFlag, isMain, parseArgs, pct, runMain, usd } from './lib/cli.js';
-import { costsFor, solPriceFrom } from './lib/liveCosts.js';
-import { ANSI, pad, pane, paint, ring, size, withScreen } from './lib/tui.js';
+import { readdir, readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { LABELS, RECORDER, RISK, STRATEGY } from '../src/config.js';
+import { LABEL } from '../src/evidence/outcome.js';
+import { isRecorderHealthy, latestSnapshot } from '../src/evidence/tail.js';
+import { readSignals } from '../src/paper/engine.js';
+import { BASE_RATE_PCT, MIN_SAMPLE, scoreRugFilter, tallyRecords } from './backtest-rug-filter.js';
+import { EXIT, isMain, intFlag, parseArgs, pct, runMain, usd } from './lib/cli.js';
+import { ANSI, pad, pane, paint, size, withScreen } from './lib/tui.js';
+import { activityStrip, buildWatchlist, sparkline } from './watchlist.js';
 
-const GATE_CONCURRENCY = 3;
 const MS_PER_SECOND = 1_000;
-const MS_PER_MINUTE = 60_000;
-const EVENT_CAPACITY = 200;
-/** Rows reserved for the header line above the panes. */
+const MS_PER_HOUR = 3_600_000;
 const HEADER_ROWS = 2;
+const VIEWS = Object.freeze(['live', 'history', 'evidence']);
 
-const USAGE = `usage: npm run dash -- [--interval S] [--feed F] [--early] [--limit N]
+const USAGE = `usage: npm run dash -- [--refresh S] [--dir PATH]
 
-One screen, four panes, refreshing: status + candidates + paper book + events.
-Ctrl+C to quit.
+One screen over the recorder's output. Makes no network calls of its own, so it
+is safe to leave running next to the recorder and the bot.
 
-  --interval S  seconds between cycles (default ${STRATEGY.tickSeconds})
-  --feed F      trending (default) | top | new
-  --early       use the UNIVERSE_PROFILES.early profile (smaller caps, younger)
-  --limit N     how many screened mints to gate per cycle (default 8)
-  --paper       also run the paper engine, so the book pane fills up
+  --refresh S  seconds between reads (default 5)
+  --view V     start on live | history | evidence
+  --dir PATH   recordings directory (default ${RECORDER.dir})
+
+  [1] LIVE      what the last scan saw, and the scan-activity history
+  [2] HISTORY   every token ever recorded, with its trace and outcome
+  [3] EVIDENCE  the labelled outcomes and what they do and do not support
+  [q] quit
 `;
 
-const clock = (ts) => new Date(ts).toISOString().slice(11, 19);
+/* -------------------------------------------------------------------- read */
 
-/**
- * Turn a 429 into an actionable sentence.
- *
- * The rate limiters in src/data are PER PROCESS: each `node scripts/...`
- * invocation starts with a fresh window and cannot see the others. GeckoTerminal
- * allows 30 req/min per IP, so running the dashboard alongside scan/record/paper
- * in separate terminals blows that shared budget even though every individual
- * process is behaving. This is the main reason the dashboard exists: one process,
- * one budget.
- * @param {unknown} err
- * @returns {string|null}
- */
-function rateLimitHint(err) {
-  const message = String(err?.message ?? err);
-  if (!/429|rate limit|too many requests/i.test(message)) return null;
-  const host = /geckoterminal/i.test(message)
-    ? 'GeckoTerminal (30 req/min)'
-    : /dexscreener/i.test(message)
-      ? 'Dexscreener (60 req/min)'
-      : 'a data source';
-  return (
-    `rate limited by ${host} -- the limit is per IP and shared across every ` +
-    'process, so close other scan/record/paper terminals or raise --interval'
-  );
+/** Everything the screen needs, straight off disk. No network. */
+async function readState({ dir, now }, deps = {}) {
+  const list = deps.readdir ?? readdir;
+  const read = deps.readFile ?? readFile;
+  let files = [];
+  try {
+    files = (await list(dir)).filter((f) => f.endsWith('.jsonl')).sort();
+  } catch {
+    /* no directory yet: everything below degrades to empty, which is honest */
+  }
+  const lines = [];
+  for (const file of files) {
+    try {
+      lines.push(...(await read(join(dir, file), 'utf8')).split('\n'));
+    } catch {
+      /* a file that vanished mid-read is not worth failing the whole screen for */
+    }
+  }
+  const { rows, ticks } = buildWatchlist(lines);
+  const snap = await latestSnapshot({ dir, now }, deps);
+  return { files, lines, rows, ticks, snap };
 }
 
-/* -------------------------------------------------------------------------- */
-/* panes                                                                      */
-/* -------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------- views */
 
-function statusPane(state, cols, rows) {
-  const f = state.funnel;
-  const rpcColour = state.rpcErrors > 0 ? ANSI.yellow : ANSI.green;
-  const lines = [
-    `${ANSI.bold}cycle${ANSI.reset} ${String(state.cycle).padEnd(6)}` +
-      `${ANSI.bold}feed${ANSI.reset} ${pad(state.feed, 10)}` +
-      `${ANSI.bold}profile${ANSI.reset} ${pad(state.profile, 10)}` +
-      `${ANSI.bold}last${ANSI.reset} ${state.lastCycleMs}ms`,
-    `${ANSI.bold}funnel${ANSI.reset}  ` +
-      `pools ${pad(f.pools, 5)}pairs ${pad(f.pairs, 5)}` +
-      `screened ${pad(f.screened, 5)}gated ${pad(f.gated, 5)}` +
-      `${ANSI.green}safe ${pad(f.safe, 4)}${ANSI.reset}` +
-      `${ANSI.cyan}would-enter ${f.wouldEnter}${ANSI.reset}`,
-    `${ANSI.bold}rpc${ANSI.reset}     ${rpcColour}${state.rpcLabel}${ANSI.reset}` +
-      `   ${ANSI.grey}errors this session: ${state.rpcErrors}${ANSI.reset}`,
+function headerLines(state) {
+  const { snap, ticks } = state;
+  const ageS = snap.snapshotAgeMs === null ? null : Math.round(snap.snapshotAgeMs / MS_PER_SECOND);
+  const healthy = isRecorderHealthy(snap.snapshotAgeMs, RECORDER.snapshotIntervalSeconds);
+  const spanH = ticks.length > 1 ? (ticks[ticks.length - 1].ts - ticks[0].ts) / MS_PER_HOUR : 0;
+
+  const status = healthy
+    ? `${ANSI.green}recording${ANSI.reset} ${ANSI.grey}(last snapshot ${ageS}s ago)${ANSI.reset}`
+    : ageS === null
+      ? `${ANSI.red}NO RECORDING${ANSI.reset} ${ANSI.grey}- run: npm run start${ANSI.reset}`
+      : `${ANSI.red}RECORDER STALE${ANSI.reset} ${ANSI.grey}(${ageS}s since last snapshot; ` +
+        `expected every ${RECORDER.snapshotIntervalSeconds}s - this screen is FROZEN, ` +
+        `not calm)${ANSI.reset}`;
+
+  const tabs = VIEWS.map((v, i) =>
+    v === state.view
+      ? `${ANSI.bold}${ANSI.cyan}[${i + 1}] ${v.toUpperCase()}${ANSI.reset}`
+      : `${ANSI.grey}[${i + 1}] ${v}${ANSI.reset}`,
+  ).join('  ');
+
+  return [
+    `${ANSI.bold}SOLSCALP${ANSI.reset}  ${status}   ${ANSI.grey}` +
+      `${ticks.length} scans over ${spanH.toFixed(1)}h${ANSI.reset}`,
+    `${tabs}   ${ANSI.grey}[q] quit  paper only, nothing here can sign${ANSI.reset}`,
   ];
-  return pane({ title: 'STATUS', lines, cols, rows, note: clock(state.now) });
 }
 
-function candidatePane(state, cols, rows) {
-  const header =
-    `${pad('MINT', 11)}${pad('SYM', 9)}${pad('MCAP', 10)}${pad('LIQ', 9)}` +
-    `${pad('AGE', 6)}${pad('5m', 8)}${pad('1h', 8)}${pad('B/S', 6)}${pad('ACC', 5)}` +
-    `${pad('SAFE?', 12)}ENTER?`;
-  const lines = [`${ANSI.grey}${header}${ANSI.reset}`];
+function liveView(state, cols, rows) {
+  const { snap, ticks } = state;
+  const at = state.now;
+  const withHits = ticks.filter((t) => t.safe > 0).length;
 
-  if (state.candidates.length === 0) {
+  const lines = [
+    `${ANSI.grey}scan activity${ANSI.reset}  ${activityStrip(ticks, Math.max(20, cols - 30))}`,
+    `${ANSI.grey}${ticks.length} scans, ${withHits} found something the gate passed` +
+      `   profile ${snap.profile ?? '?'}${ANSI.reset}`,
+    '',
+  ];
+
+  if (ticks.length === 0) {
+    // Nothing has ever scanned. Saying "the filter is working" here would be a
+    // lie of exactly the kind this project exists to avoid: an empty screen
+    // because nothing ran is not an empty screen because nothing qualified.
+    lines.push(`${ANSI.yellow}Nothing has been recorded yet.${ANSI.reset}`);
     lines.push('');
-    lines.push(`${ANSI.grey}  nothing has passed the universe screen yet.${ANSI.reset}`);
-    lines.push(`${ANSI.grey}  98.6% of these tokens are rugs or sub-$1k liquidity, so an${ANSI.reset}`);
-    lines.push(`${ANSI.grey}  empty list is the filter working, not the filter broken.${ANSI.reset}`);
-    return pane({ title: 'CANDIDATES', lines, cols, rows });
+    lines.push(`${ANSI.grey}This screen only shows what the recorder wrote, and the recorder has${ANSI.reset}`);
+    lines.push(`${ANSI.grey}not written anything. That is not a quiet market -- it is no data.${ANSI.reset}`);
+    lines.push('');
+    lines.push(`${ANSI.bold}Start it with:  npm run start${ANSI.reset}`);
+    return pane({ title: 'LAST SCAN', lines, cols, rows });
   }
 
-  for (const c of state.candidates) {
-    const s = c.signals;
-    const safe = c.gate.buyable
+  if (snap.candidates.length === 0) {
+    lines.push(`${ANSI.grey}The last scan saw nothing that cleared the universe screen.${ANSI.reset}`);
+    lines.push(`${ANSI.grey}98.6% of these tokens are rugs or under $1k liquidity, so an empty${ANSI.reset}`);
+    lines.push(`${ANSI.grey}scan is the filter working. The strip above is the proof it is running.${ANSI.reset}`);
+    return pane({ title: 'LAST SCAN', lines, cols, rows });
+  }
+
+  lines.push(
+    `${ANSI.grey}${pad('TOKEN', 11)}${pad('MCAP', 10)}${pad('LIQ', 10)}${pad('5m', 8)}` +
+      `${pad('1h', 9)}${pad('B/S', 6)}${pad('ACC', 6)}${pad('SEEN', 6)}${pad('SAFE?', 22)}` +
+      `ENTER?${ANSI.reset}`,
+  );
+
+  for (const c of snap.candidates) {
+    const pair = snap.pairs.find((p) => p.mint === c.mint);
+    const s = pair ? readSignals(pair, at) : {};
+    const row = state.rows.find((r) => r.mint === c.mint);
+    const gate = snap.gateResults[c.mint];
+    const safe = gate?.buyable
       ? `${ANSI.green}SAFE${ANSI.reset}`
-      : `${ANSI.red}blocked${ANSI.reset}`;
-    const safeWhy = c.gate.buyable
-      ? ''
-      : `${ANSI.grey}${[...c.gate.rejectedBy, ...c.gate.erroredIn][0] ?? ''}${ANSI.reset}`;
-    const enter = !c.gate.buyable
+      : `${ANSI.red}blocked${ANSI.reset} ${ANSI.grey}${(gate?.rejectedBy?.[0] ?? gate?.erroredIn?.[0] ?? '').slice(0, 13)}${ANSI.reset}`;
+    // The entry decision is a SEPARATE question from safety, and collapsing the
+    // two is the most expensive misreading available here.
+    const enter = !gate?.buyable
       ? `${ANSI.grey}-${ANSI.reset}`
-      : c.entry.enter
+      : (c.wouldEnter ?? false)
         ? `${ANSI.bold}${ANSI.green}YES${ANSI.reset}`
         : `${ANSI.grey}no${ANSI.reset}`;
     lines.push(
-      pad(c.mint.slice(0, 10), 11) +
-        pad((c.symbol ?? '?').slice(0, 8), 9) +
-        pad(usd(s.marketCapUsd), 10) +
-        pad(usd(s.liquidityUsd), 9) +
-        pad(s.ageMinutes === null ? 'n/a' : `${Math.round(s.ageMinutes)}m`, 6) +
-        pad(pct(s.priceChangeM5Pct), 8) +
-        pad(pct(s.priceChangeH1Pct), 8) +
-        pad(s.buySellRatioM5 === null ? 'n/a' : s.buySellRatioM5.toFixed(1), 6) +
-        pad(s.volumeAccelerationRatio === null ? 'n/a' : s.volumeAccelerationRatio.toFixed(1), 5) +
-        pad(`${safe} ${safeWhy}`, 12) +
+      pad((c.symbol ?? '?').slice(0, 10), 11) +
+        pad(usd(s.marketCapUsd ?? c.marketCapUsd), 10) +
+        pad(usd(s.liquidityUsd ?? c.liquidityUsd), 10) +
+        pad(pct(c.priceChangeM5Pct), 8) +
+        pad(pct(c.priceChangeH1Pct), 9) +
+        pad(c.buySellRatioM5 === null ? 'n/a' : c.buySellRatioM5.toFixed(1), 6) +
+        pad(c.volumeAccelerationRatio === null ? 'n/a' : c.volumeAccelerationRatio.toFixed(1), 6) +
+        pad(String(row?.seen ?? 1), 6) +
+        pad(safe, 22) +
         enter,
     );
   }
   return pane({
-    title: 'CANDIDATES',
+    title: 'LAST SCAN',
     lines,
     cols,
     rows,
-    note: 'SAFE? = gate   ENTER? = rules fired',
+    note: 'SAFE? = gate   ENTER? = momentum rules',
   });
 }
 
-function bookPane(state, cols, rows) {
-  const book = state.engine.portfolio;
-  const closed = book.closedTrades;
-  const wins = closed.filter((t) => t.win).length;
+function historyView(state, cols, rows) {
+  // Every token ever recorded, worst first. The trace is real: one point per
+  // sighting, which is why it is evidence rather than decoration.
+  const enriched = state.rows
+    .map((r) => {
+      const lastLiq = [...r.series].reverse().find((p) => typeof p.liq === 'number')?.liq ?? null;
+      // The labeller re-fetched to decide; its measurement is the honest "now".
+      // The recording's own tail is not: the recorder stops observing a token the
+      // moment it falls out of the screen, so its last value is the last HEALTHY
+      // reading rather than the outcome.
+      const measured = r.labelEvidence?.liquidityAfterUsd ?? null;
+      const nowLiq = measured ?? lastLiq;
+      const change =
+        r.entryLiquidityUsd && nowLiq !== null && r.entryLiquidityUsd > 0
+          ? ((nowLiq - r.entryLiquidityUsd) / r.entryLiquidityUsd) * 100
+          : null;
+      return { ...r, nowLiq, change, measured: measured !== null };
+    })
+    .sort((a, b) => (a.change ?? 0) - (b.change ?? 0));
+
   const lines = [
-    `${ANSI.bold}equity${ANSI.reset} ${pad(usd(portfolioEquityUsd(book)), 12)}` +
-      `${ANSI.bold}realised${ANSI.reset} ${pad(usd(book.realisedPnlUsd), 11)}` +
-      `${ANSI.bold}costs${ANSI.reset} ${pad(usd(book.costsPaidUsd), 10)}` +
-      `${ANSI.bold}trades${ANSI.reset} ${closed.length} (${wins}W)`,
-    state.paperEnabled
-      ? `${ANSI.grey}open ${Object.keys(book.positions).length}/${RISK.maxConcurrentPositions}` +
-        `   kill switch: ${state.engine.killSwitch?.tripped ? `${ANSI.red}TRIPPED` : 'ok'}${ANSI.reset}`
-      : `${ANSI.grey}paper engine off -- pass --paper to trade these candidates${ANSI.reset}`,
+    `${ANSI.grey}${pad('TOKEN', 11)}${pad('LIQ@ENTRY', 11)}${pad('LATEST', 11)}${pad('CHANGE', 9)}` +
+      `${pad('TRACE', 14)}${pad('SEEN', 6)}${pad('AGE', 6)}${pad('GATE', 9)}OUTCOME${ANSI.reset}`,
+  ];
+  for (const r of enriched) {
+    const label = r.storedLabel ?? '';
+    const tone =
+      label === LABEL.RUGGED ? ANSI.red : label === LABEL.SURVIVED ? ANSI.green : ANSI.grey;
+    lines.push(
+      pad((r.symbol ?? '?').slice(0, 10), 11) +
+        pad(usd(r.entryLiquidityUsd), 11) +
+        pad(usd(r.nowLiq) + (r.measured ? '' : `${ANSI.grey}~${ANSI.reset}`), 11) +
+        pad(r.change === null ? 'n/a' : pct(r.change), 9) +
+        pad(sparkline(r.series, 12), 14) +
+        pad(String(r.seen), 6) +
+        pad(`${((state.now - r.firstTs) / MS_PER_HOUR).toFixed(0)}h`, 6) +
+        pad(r.gateBuyable ? `${ANSI.green}passed${ANSI.reset}` : `${ANSI.grey}blocked${ANSI.reset}`, 9) +
+        `${tone}${label || 'unlabelled'}${ANSI.reset}`,
+    );
+  }
+  return pane({
+    title: `HISTORY - ${enriched.length} tokens ever recorded`,
+    lines,
+    cols,
+    rows,
+    note: '~ = last recorded, not re-measured',
+  });
+}
+
+function evidenceView(state, cols, rows) {
+  const tally = tallyRecords(state.lines);
+  const report = scoreRugFilter(tally);
+  const lines = [
+    `${ANSI.bold}THE QUESTION${ANSI.reset} ${ANSI.grey}of the tokens the gate APPROVED,` +
+      ` what fraction later rugged?${ANSI.reset}`,
+    '',
+    `  snapshots recorded   ${tally.snapshots}`,
+    `  unique mints seen    ${tally.uniqueMints}`,
+    `  gate approved        ${tally.approved + tally.unlabelled}`,
+    `    labelled           ${tally.approved}`,
+    `    ${ANSI.grey}still unlabelled   ${tally.unlabelled}  <- counted as UNKNOWN, never as survived${ANSI.reset}`,
+    `  gate blocked         ${tally.rejected}`,
+    `    ${ANSI.grey}labelled ${tally.blockedLabelled}, of those rugged ${tally.blockedRugged}${ANSI.reset}`,
     '',
   ];
 
-  for (const [mint, p] of Object.entries(book.positions)) {
-    const pnlPct = ((p.lastPriceUsd - p.entryPriceUsd) / p.entryPriceUsd) * 100;
-    const colour = pnlPct >= 0 ? ANSI.green : ANSI.red;
+  if (!report.sufficient) {
+    lines.push(`${ANSI.yellow}NO RATE REPORTED${ANSI.reset}`);
+    lines.push(`  ${report.reason}`);
+    lines.push('');
     lines.push(
-      pad(mint.slice(0, 10), 11) +
-        pad(usd(p.sizeUsd), 9) +
-        pad(`${colour}${pct(pnlPct)}${ANSI.reset}`, 10) +
-        pad(`held ${Math.round((state.now - p.openedTs) / MS_PER_MINUTE)}m`, 12) +
-        `${ANSI.grey}peak ${usd(state.engine.peaks?.[mint] ?? p.entryPriceUsd)}${ANSI.reset}`,
+      `${ANSI.grey}  Labelling runs automatically every ${LABELS.autoLabelEveryMinutes} min; a token needs` +
+        ` ${LABELS.minAgeHoursBeforeLabelling}h before${ANSI.reset}`,
     );
+    lines.push(`${ANSI.grey}  its outcome means anything. This is the slow part and cannot be rushed:${ANSI.reset}`);
+    lines.push(`${ANSI.grey}  the dataset cannot be reconstructed after the fact.${ANSI.reset}`);
+  } else {
+    lines.push(
+      `${ANSI.bold}  approved-and-rugged  ${report.rugged}/${report.approved} = ` +
+        `${report.ruggedPct.toFixed(1)}%${ANSI.reset}`,
+    );
+    lines.push(`  95% interval         ${report.interval.low.toFixed(1)}% .. ${report.interval.high.toFixed(1)}%`);
+    lines.push(`  population base rate ${BASE_RATE_PCT}%`);
+    lines.push(`  lift                 ${report.liftPctPoints.toFixed(1)} percentage points`);
+    lines.push('');
+    if (tally.blockedLabelled >= MIN_SAMPLE) {
+      const blockedPct = (tally.blockedRugged / tally.blockedLabelled) * 100;
+      const gap = blockedPct - report.ruggedPct;
+      lines.push(`${ANSI.bold}  CONTROL: rejected-and-rugged ${blockedPct.toFixed(1)}%${ANSI.reset}`);
+      lines.push(`  separation ${gap.toFixed(1)} points`);
+      lines.push(
+        gap <= 0
+          ? `${ANSI.red}  NOT DISCRIMINATING: what it blocked rugged no more often than what it passed.${ANSI.reset}`
+          : `${ANSI.green}  The gate blocked a dirtier cohort than it passed.${ANSI.reset}`,
+      );
+    } else {
+      lines.push(
+        `${ANSI.grey}  No control comparison yet: ${tally.blockedLabelled} labelled rejects, ` +
+          `${MIN_SAMPLE} needed. Beating the base rate alone cannot show it discriminates.${ANSI.reset}`,
+      );
+    }
   }
-  if (Object.keys(book.positions).length === 0 && state.paperEnabled) {
-    lines.push(`${ANSI.grey}  no open positions${ANSI.reset}`);
-  }
-  return pane({ title: 'PAPER BOOK (no keypair exists)', lines, cols, rows });
+  return pane({ title: 'EVIDENCE', lines, cols, rows });
 }
 
-function eventPane(state, cols, rows) {
-  const lines = state.events
-    .all()
-    .slice(-(rows - 1))
-    .map((e) => `${ANSI.grey}${clock(e.ts)}${ANSI.reset} ${e.colour ?? ''}${e.text}${ANSI.reset}`);
-  return pane({ title: 'EVENTS', lines, cols, rows });
+function footerLines(state, cols) {
+  const book = `${ANSI.grey}book ${usd(RISK.bookSizeUsd)}  position ${usd(RISK.positionSizeUsd)}  ` +
+    `mcap ${usd(STRATEGY.universe.minMarketCapUsd)}-${usd(STRATEGY.universe.maxMarketCapUsd)}${ANSI.reset}`;
+  return [pad(book, cols)];
 }
-
-/* -------------------------------------------------------------------------- */
-/* render                                                                     */
-/* -------------------------------------------------------------------------- */
 
 function render(state) {
   const { cols, rows } = size();
-  const available = rows - HEADER_ROWS;
-  // Candidates get the most room; the other three split what is left.
-  const statusRows = 4;
-  const bookRows = Math.max(4, Math.min(8, Math.floor(available * 0.25)));
-  const eventRows = Math.max(4, Math.min(8, Math.floor(available * 0.25)));
-  const candRows = Math.max(4, available - statusRows - bookRows - eventRows);
-
-  const header =
-    `${ANSI.bold}SOLSCALP${ANSI.reset} ${ANSI.grey}live dashboard -- paper only, ` +
-    `nothing here can sign a transaction. Ctrl+C to quit.${ANSI.reset}`;
-
-  paint([
-    header,
-    '',
-    ...statusPane(state, cols, statusRows),
-    ...candidatePane(state, cols, candRows),
-    ...bookPane(state, cols, bookRows),
-    ...eventPane(state, cols, eventRows),
-  ]);
+  const header = headerLines(state);
+  const footer = footerLines(state, cols);
+  const body = Math.max(6, rows - HEADER_ROWS - footer.length - 1);
+  const view =
+    state.view === 'history'
+      ? historyView(state, cols, body)
+      : state.view === 'evidence'
+        ? evidenceView(state, cols, body)
+        : liveView(state, cols, body);
+  paint([...header, ...view, ...footer]);
 }
 
-/* -------------------------------------------------------------------------- */
-/* cycle                                                                      */
-/* -------------------------------------------------------------------------- */
-
-async function cycle(state, deps) {
-  const startedAt = deps.now();
-  const pools = [];
-  for (let page = 1; page <= deps.pages; page += 1) {
-    pools.push(...(await deps.fetchPools({ page })));
-  }
-  const feedMints = [...new Set(pools.map((p) => p.baseMint).filter(Boolean))];
-  const held = Object.keys(state.engine.portfolio.positions);
-  const pairsByMint = await deps.fetchPairs([...new Set([...feedMints, ...held])]);
-  const pairs = [...pairsByMint.values()].filter((p) => p !== null);
-
-  const at = deps.now();
-  const screened = pairs
-    .filter((pair) => universeReasons(pair, at, deps.universe).length === 0)
-    .map((pair) => ({ pair, signals: readSignals(pair, at) }))
-    .sort((a, b) => (b.signals.volumeAccelerationRatio ?? 0) - (a.signals.volumeAccelerationRatio ?? 0))
-    .slice(0, deps.limit);
-
-  const gateLimit = pLimit(GATE_CONCURRENCY);
-  const gateResults = Object.fromEntries(
-    await Promise.all(
-      screened.map((row) =>
-        gateLimit(async () => [row.pair.mint, await deps.gate(row.pair.mint, { rpc: deps.rpc })]),
-      ),
-    ),
-  );
-
-  const solPriceUsd = solPriceFrom(pairs);
-  const costs = costsFor({
-    pairs: screened.map((r) => r.pair),
-    gates: gateResults,
-    solPriceUsd,
-  });
-
-  // Recheck open positions on the configured timer: a held token can BECOME a
-  // honeypot, and that is an immediate exit rather than a next-cycle concern.
-  let gateRechecks = {};
-  if (held.length > 0 && at - state.lastRecheckAt >= SAFETY.recheckOpenPositionsSeconds * MS_PER_SECOND) {
-    gateRechecks = Object.fromEntries(
-      await Promise.all(
-        held.map((mint) => gateLimit(async () => [mint, await deps.recheck(mint, { rpc: deps.rpc })])),
-      ),
-    );
-    state.lastRecheckAt = at;
-  }
-
-  const engine = deps.paperEnabled
-    ? stepEngine(state.engine, {
-        ts: at,
-        pairs: screened.map((r) => r.pair).concat(pairs.filter((p) => held.includes(p.mint))),
-        gateResults,
-        gateRechecks,
-        costs,
-        universe: deps.universe,
-      })
-    : state.engine;
-
-  for (const action of engine.actions ?? []) {
-    if (action.kind === 'open') {
-      state.events.push({ ts: at, text: `OPEN  ${action.mint.slice(0, 10)} @ ${usd(action.entryPriceUsd)}`, colour: ANSI.green });
-    } else if (action.kind === 'close') {
-      state.events.push({ ts: at, text: `CLOSE ${action.mint.slice(0, 10)} (${action.reason})`, colour: ANSI.yellow });
-    } else if (action.kind === 'kill-switch') {
-      state.events.push({ ts: at, text: `KILL SWITCH: ${action.reasons.join('; ')}`, colour: ANSI.red });
-    }
-  }
-
-  const candidates = screened.map((row) => {
-    const gate = gateResults[row.pair.mint];
-    const costBreakdown = costs[row.pair.mint];
-    const entry =
-      costBreakdown === undefined
-        ? { enter: false, reasons: ['round trip not priceable'] }
-        : deps.decideEntry({
-            pair: row.pair,
-            portfolio: engine.portfolio,
-            gateResult: gate,
-            costBreakdown,
-            now: at,
-            universe: deps.universe,
-          });
-    return {
-      mint: row.pair.mint,
-      symbol: row.pair.baseToken?.symbol ?? null,
-      signals: row.signals,
-      gate,
-      entry,
-    };
-  });
-
-  const safe = candidates.filter((c) => c.gate.buyable);
-  const wouldEnter = safe.filter((c) => c.entry.enter);
-  const erroredLayers = candidates.flatMap((c) => c.gate.erroredIn);
-
-  return {
-    ...state,
-    engine,
-    candidates,
-    now: at,
-    cycle: state.cycle + 1,
-    lastCycleMs: deps.now() - startedAt,
-    rpcErrors: state.rpcErrors + (erroredLayers.length > 0 ? 1 : 0),
-    funnel: {
-      pools: pools.length,
-      pairs: pairs.length,
-      screened: screened.length,
-      gated: Object.keys(gateResults).length,
-      safe: safe.length,
-      wouldEnter: wouldEnter.length,
-    },
-  };
-}
-
-/* -------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------- main */
 
 /**
  * @param {readonly string[]} argv
- * @param {object} [injected] test seam
+ * @param {object} [injected]
  * @returns {Promise<number>}
  */
 export async function main(argv, injected = {}) {
@@ -347,77 +322,62 @@ export async function main(argv, injected = {}) {
     (injected.out ?? console.log)(USAGE);
     return EXIT.OK;
   }
-
-  const env = (injected.loadEnv ?? loadEnv)();
-  if (env.mode !== MODES.PAPER || env.isLive !== false) {
-    (injected.out ?? console.log)(`refusing to run: mode is "${env.mode}". Paper only.`);
-    return EXIT.ERROR;
-  }
-
-  const feed = typeof flags.feed === 'string' ? flags.feed : 'trending';
-  const FEEDS = { trending: getTrendingPools, top: getTopPools, new: getNewPools };
-  if (!Object.hasOwn(FEEDS, feed)) {
-    (injected.out ?? console.log)(`unknown --feed "${feed}"`);
-    return EXIT.ERROR;
-  }
-
-  const { decideEntry } = await import('../src/paper/engine.js');
-  const deps = {
-    now: injected.now ?? Date.now,
-    sleep: injected.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))),
-    fetchPools: injected.fetchPools ?? FEEDS[feed],
-    fetchPairs: injected.fetchPairs ?? getBestPairs,
-    gate: injected.runGate ?? runGate,
-    recheck: injected.recheckGate ?? recheckGate,
-    decideEntry: injected.decideEntry ?? decideEntry,
-    rpc: injected.rpc ?? (await buildRpc(env)),
-    universe: flags.early === true ? UNIVERSE_PROFILES.early : undefined,
-    limit: intFlag(flags.limit, 8),
-    pages: intFlag(flags.pages, 1),
-    paperEnabled: flags.paper === true,
-  };
-
-  let state = {
-    cycle: 0,
-    now: deps.now(),
-    lastCycleMs: 0,
-    lastRecheckAt: 0,
-    rpcErrors: 0,
-    rpcLabel: deps.rpc.endpoint ?? 'unknown',
-    feed,
-    profile: flags.early === true ? 'early' : 'standard',
-    paperEnabled: deps.paperEnabled,
-    funnel: { pools: 0, pairs: 0, screened: 0, gated: 0, safe: 0, wouldEnter: 0 },
-    candidates: [],
-    engine: createEngineState({ portfolio: emptyPortfolio({}) }),
-    events: ring(EVENT_CAPACITY),
-  };
-
+  const dir = typeof flags.dir === 'string' ? flags.dir : RECORDER.dir;
+  const refreshMs = intFlag(flags.refresh, 5) * MS_PER_SECOND;
+  const now = injected.now ?? Date.now;
+  const sleep = injected.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   const maxCycles = flags.cycles === undefined ? Infinity : intFlag(flags.cycles, 1);
-  state.events.push({ ts: state.now, text: 'dashboard started -- paper only' });
+
+  // --view picks the starting pane, so a view can be scripted or captured without
+  // keystrokes (and so this screen is testable at all).
+  let view = VIEWS.includes(flags.view) ? flags.view : VIEWS[0];
+  let running = true;
+
+  // Raw mode so a single keypress switches view without waiting for Enter.
+  const stdin = injected.stdin ?? process.stdin;
+  const interactive = typeof stdin.setRawMode === 'function' && stdin.isTTY;
+  if (interactive) {
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.setEncoding('utf8');
+    stdin.on('data', (key) => {
+      if (key === 'q' || key === '') running = false;
+      else if (key === '1') view = VIEWS[0];
+      else if (key === '2') view = VIEWS[1];
+      else if (key === '3') view = VIEWS[2];
+    });
+  }
 
   await withScreen(async () => {
-    render(state);
-    while (state.cycle < maxCycles) {
+    let cycles = 0;
+    while (running && cycles < maxCycles) {
+      const at = now();
+      let state;
       try {
-        state = await cycle(state, deps);
+        state = { ...(await readState({ dir, now: at }, injected)), view, now: at };
       } catch (err) {
-        // A failed cycle must never kill the dashboard: the next one may work,
-        // and a visible error line is more useful than a dead screen.
-        state.events.push({
-          ts: deps.now(),
-          text: rateLimitHint(err) ?? `cycle failed: ${err?.message ?? err}`,
-          colour: ANSI.red,
-        });
-        state = { ...state, cycle: state.cycle + 1, rpcErrors: state.rpcErrors + 1 };
+        state = {
+          files: [], lines: [], rows: [], ticks: [],
+          snap: { snapshotAgeMs: null, candidates: [], pairs: [], gateResults: {}, profile: null },
+          view, now: at, error: err?.message ?? String(err),
+        };
       }
       render(state);
-      if (state.cycle < maxCycles) {
-        await deps.sleep(intFlag(flags.interval, STRATEGY.tickSeconds) * MS_PER_SECOND);
+      cycles += 1;
+      if (running && cycles < maxCycles) {
+        // Poll in slices so a keypress is felt immediately rather than after a
+        // whole refresh interval.
+        for (let waited = 0; waited < refreshMs && running; waited += 120) {
+          await sleep(Math.min(120, refreshMs - waited));
+        }
       }
     }
   });
 
+  if (interactive) {
+    stdin.setRawMode(false);
+    stdin.pause();
+  }
   return EXIT.OK;
 }
 

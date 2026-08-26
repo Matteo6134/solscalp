@@ -26,12 +26,14 @@
 import { appendFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import pLimit from 'p-limit';
-import { RECORDER, STRATEGY, UNIVERSE_PROFILES } from '../src/config.js';
+import { LABELS, RECORDER, STRATEGY, UNIVERSE_PROFILES } from '../src/config.js';
 import { getBestPairs } from '../src/data/dexscreener.js';
 import { getTrendingPools } from '../src/data/geckoterminal.js';
 import { loadEnv } from '../src/env.js';
 import { runLabellingPass } from '../src/evidence/labeller.js';
-import { readSignals, universeReasons } from '../src/paper/engine.js';
+import { decideEntry, readSignals, universeReasons } from '../src/paper/engine.js';
+import { emptyPortfolio } from '../src/paper/portfolio.js';
+import { costsFor, solPriceFrom } from './lib/liveCosts.js';
 import { runGate } from '../src/safety/index.js';
 import { EXIT, buildRpc, intFlag, isMain, parseArgs, runMain, say } from './lib/cli.js';
 
@@ -57,7 +59,7 @@ export const dayFile = (ts) => `${new Date(ts).toISOString().slice(0, ISO_DATE_L
  * Shape one snapshot line. Pure, so its structure is testable without a disk.
  * @returns {object} one JSONL record
  */
-export function buildRecord({ ts, profile, rows }) {
+export function buildRecord({ ts, profile, rows, entries = {} }) {
   return {
     schemaVersion: RECORDER.schemaVersion,
     ts,
@@ -68,6 +70,7 @@ export function buildRecord({ ts, profile, rows }) {
     // price a trade without re-quoting Jupiter. Without these, decideEntry has no
     // cost breakdown and correctly refuses every entry.
     const sim = gate.layers.find((l) => l.layer === 'layer1-sellsim')?.facts ?? {};
+    const entry = entries[pair.mint] ?? null;
     return ({
       mint: pair.mint,
       symbol: pair.baseToken?.symbol ?? null,
@@ -101,6 +104,12 @@ export function buildRecord({ ts, profile, rows }) {
         reasons: [...gate.reasons],
         elapsedMs: gate.elapsedMs,
       },
+      // The ENTRY decision, computed once here and stored. It is a SEPARATE
+      // question from the gate verdict -- safe is not the same as worth buying --
+      // and storing it means every reader shows the same answer instead of each
+      // re-deriving it from a different cost guess.
+      wouldEnter: entry?.enter ?? null,
+      entryBlockedBy: entry === null ? null : [...entry.reasons].slice(0, 3),
       roundTrip: {
         buyPriceImpactPct: sim.buyPriceImpactPct ?? null,
         sellPriceImpactPct: sim.sellPriceImpactPct ?? null,
@@ -166,6 +175,17 @@ export async function main(argv, deps = {}) {
   // on the first tick: if the process has been down, there is catching up to do.
   let lastLabelAt = 0;
   let labelled = 0;
+  // Read the interval ONCE and refuse a missing one loudly. The first version of
+  // this read RECORDER.autoLabelEveryMinutes while the value lives on LABELS, so
+  // the comparison was 'ts >= NaN' -- always false -- and labelling silently never
+  // ran. A maintenance job that quietly does nothing is the worst outcome here,
+  // because the dataset keeps growing and stays unscoreable while looking healthy.
+  const labelEveryMs = LABELS.autoLabelEveryMinutes * 60 * MS_PER_SECOND;
+  if (!Number.isFinite(labelEveryMs) || labelEveryMs <= 0) {
+    throw new TypeError(
+      `LABELS.autoLabelEveryMinutes must be a positive number, got ${String(LABELS.autoLabelEveryMinutes)}`,
+    );
+  }
   let stopped = false;
   const stop = () => {
     stopped = true;
@@ -184,7 +204,38 @@ export async function main(argv, deps = {}) {
         gate: deps.runGate ?? runGate,
         concurrency: deps.concurrency ?? GATE_CONCURRENCY,
       });
-      const record = buildRecord({ ts, profile, rows });
+      // Price the round trip and ask the entry rules, once, here. No extra
+      // network: the impacts come from the gate's own layer-1 verdict.
+      const solPriceUsd = solPriceFrom(rows.map((r) => r.pair));
+      const costs = costsFor({
+        pairs: rows.map((r) => r.pair),
+        gates: Object.fromEntries(rows.map((r) => [r.pair.mint, r.gate])),
+        solPriceUsd,
+      });
+      const book = emptyPortfolio({});
+      const entries = Object.fromEntries(
+        rows.map((r) => {
+          const cost = costs[r.pair.mint];
+          if (cost === undefined) return [r.pair.mint, null];
+          try {
+            return [
+              r.pair.mint,
+              decideEntry({
+                pair: r.pair,
+                portfolio: book,
+                gateResult: r.gate,
+                costBreakdown: cost,
+                now: ts,
+                universe,
+              }),
+            ];
+          } catch {
+            // An unpriceable round trip is a refusal, not a crash.
+            return [r.pair.mint, null];
+          }
+        }),
+      );
+      const record = buildRecord({ ts, profile, rows, entries });
       // One stringify, one newline, one append: a partial write cannot straddle
       // two records, so every earlier line stays independently parseable.
       await write(join(dir, dayFile(ts)), `${JSON.stringify(record)}\n`, 'utf8');
@@ -200,7 +251,7 @@ export async function main(argv, deps = {}) {
       out(`[tick failed, continuing] ${err?.message ?? err}`);
     }
     // --- periodic labelling: maintenance of the dataset we just appended to ---
-    if (ts - lastLabelAt >= RECORDER.autoLabelEveryMinutes * 60 * MS_PER_SECOND) {
+    if (ts - lastLabelAt >= labelEveryMs) {
       lastLabelAt = ts;
       try {
         const pass = await (deps.runLabellingPass ?? runLabellingPass)({ dir, now: ts });

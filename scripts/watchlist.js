@@ -106,7 +106,13 @@ export function buildWatchlist(lines) {
 
   for (const [mint, entry] of labels) {
     const row = rows.get(mint);
-    if (row !== undefined) row.storedLabel = entry.outcome;
+    if (row === undefined) continue;
+    row.storedLabel = entry.outcome;
+    // The labeller RE-FETCHED to decide, so its figure is the honest 'now'. The
+    // recording's own tail is not: the recorder stops observing a token the
+    // moment it falls out of the screen, so its last value is the last HEALTHY
+    // reading rather than the outcome.
+    row.labelEvidence = entry.evidence ?? null;
   }
   return { rows: [...rows.values()], ticks };
 }
