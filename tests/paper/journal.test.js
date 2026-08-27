@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { JOURNAL } from '../../src/config.js';
 import {
   BOOK_TRADE_TAIL,
+  CANDLE_CAP,
   appendJournal,
+  buildCandlesRecord,
   buildBookRecord,
   buildTradeRecord,
   journalFile,
@@ -233,5 +235,78 @@ describe('loadJournal', () => {
     expect(out.book.equityUsd).toBeCloseTo(439, 5);
     expect(out.trades).toHaveLength(1);
     expect(out.trades[0].netPnlUsd).toBeCloseTo(-8.4, 5);
+  });
+});
+
+describe('candles in the journal', () => {
+  const min = 60_000;
+  const base = Date.UTC(2026, 7, 27, 10, 0, 0);
+  const bar = (i, close, high = close) => ({
+    ts: base + i * min, open: close, high, low: close, close, volumeUsd: 10,
+  });
+
+  it('collects candles per mint, oldest first', () => {
+    const lines = [
+      JSON.stringify(buildCandlesRecord({ ts: base, mint: A, candles: [bar(0, 1), bar(1, 2)] })),
+      JSON.stringify(buildCandlesRecord({ ts: base, mint: B, candles: [bar(0, 9)] })),
+    ];
+    const out = readJournal(lines);
+
+    expect(out.candles.get(A).map((c) => c.close)).toEqual([1, 2]);
+    expect(out.candles.get(B).map((c) => c.close)).toEqual([9]);
+  });
+
+  /**
+   * The forming-bar case, and the reason this is last-write-wins rather than
+   * first. The newest candle of a live minute is incomplete when it is written;
+   * the next fetch carries the same timestamp with a higher high and a different
+   * close. Keeping the first would freeze every bar at its first observation.
+   */
+  it('a later line supersedes an earlier candle with the same timestamp', () => {
+    const lines = [
+      JSON.stringify(buildCandlesRecord({ ts: base, mint: A, candles: [bar(0, 1, 1)] })),
+      JSON.stringify(buildCandlesRecord({ ts: base + min, mint: A, candles: [bar(0, 5, 7)] })),
+    ];
+    const out = readJournal(lines);
+
+    expect(out.candles.get(A)).toHaveLength(1);
+    expect(out.candles.get(A)[0].close).toBe(5);
+    expect(out.candles.get(A)[0].high).toBe(7);
+  });
+
+  it('caps the history it keeps', () => {
+    const many = Array.from({ length: CANDLE_CAP + 50 }, (_, i) => bar(i, i));
+    const out = readJournal([JSON.stringify(buildCandlesRecord({ ts: base, mint: A, candles: many }))]);
+
+    expect(out.candles.get(A)).toHaveLength(CANDLE_CAP);
+    // The NEWEST are kept: a chart of stale bars is worse than a short one.
+    expect(out.candles.get(A).at(-1).close).toBe(CANDLE_CAP + 49);
+  });
+
+  it('drops a candle with no timestamp or no close instead of charting a hole', () => {
+    const out = readJournal([
+      JSON.stringify({
+        schemaVersion: JOURNAL.schemaVersion, type: 'candles', ts: base, mint: A,
+        candles: [bar(0, 1), { ts: null, close: 2 }, { ts: base + min, close: null }],
+      }),
+    ]);
+
+    expect(out.candles.get(A)).toHaveLength(1);
+  });
+
+  it('a book with no candles yields no entry rather than an empty array', () => {
+    const out = readJournal([]);
+    expect(out.candles.size).toBe(0);
+  });
+
+  it('the pool address rides along on the position, since OHLCV is keyed by it', () => {
+    const pf = tradedBook();
+    const rec = buildBookRecord({
+      ts: T, portfolio: pf, equityUsd: 0, pools: { [B]: 'POOL_B' },
+    });
+
+    expect(rec.positions[0].pairAddress).toBe('POOL_B');
+    // Unknown is null, never a guess or the mint reused as a pool.
+    expect(buildBookRecord({ ts: T, portfolio: pf, equityUsd: 0 }).positions[0].pairAddress).toBeNull();
   });
 });

@@ -1,7 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 import { RECORDER } from '../../src/config.js';
 import { EMPTY, buildDashData } from '../../scripts/lib/dashData.js';
-import { filterHistory, fitColumns, groupCounts, positionRows } from '../../scripts/dash.js';
+import {
+  aggregateCandles,
+  filterHistory,
+  fitColumns,
+  groupCounts,
+  positionRows,
+} from '../../scripts/dash.js';
 
 const TS = 1_756_000_000_000;
 const MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
@@ -240,5 +246,60 @@ describe('positionRows', () => {
     const original = [...trades];
     positionRows(book, trades);
     expect(trades).toEqual(original);
+  });
+});
+
+describe('aggregateCandles', () => {
+  const min = 60_000;
+  const base = Date.UTC(2026, 7, 27, 10, 0, 0);
+  const c = (i, o, h_, l, cl, v) => ({ ts: base + i * min, open: o, high: h_, low: l, close: cl, volumeUsd: v });
+  const ten = [
+    c(0, 10, 12, 9, 11, 100),
+    c(1, 11, 15, 10, 14, 200),
+    c(2, 14, 14, 8, 9, 50),
+    c(3, 9, 10, 7, 8, 10),
+    c(4, 8, 20, 8, 19, 400),
+    c(5, 19, 19, 18, 18, 1),
+  ];
+
+  it('one minute is the identity, not a rebuild', () => {
+    expect(aggregateCandles(ten, 1)).toBe(ten);
+  });
+
+  it('rolls five bars into one with the right OHLCV', () => {
+    const out = aggregateCandles(ten.slice(0, 5), 5);
+    expect(out).toHaveLength(1);
+    // Open from the FIRST bar, close from the LAST, extremes across all of them.
+    expect(out[0].open).toBe(10);
+    expect(out[0].close).toBe(19);
+    expect(out[0].high).toBe(20);
+    expect(out[0].low).toBe(7);
+    expect(out[0].volumeUsd).toBe(760);
+  });
+
+  it('buckets on absolute epoch time, so bars do not shift as data arrives', () => {
+    // The distinguishing property. Bucketing relative to the newest candle would
+    // redraw every bar boundary each time a minute ticked over.
+    const first = aggregateCandles(ten.slice(0, 5), 5);
+    const withMore = aggregateCandles(ten, 5);
+    expect(withMore[0].ts).toBe(first[0].ts);
+    expect(withMore[0].open).toBe(first[0].open);
+    expect(withMore[0].high).toBe(first[0].high);
+  });
+
+  it('a sixth minute opens a new bucket', () => {
+    const out = aggregateCandles(ten, 5);
+    expect(out).toHaveLength(2);
+    expect(out[1].open).toBe(19);
+    expect(out[1].volumeUsd).toBe(1);
+  });
+
+  it('handles an empty series', () => {
+    expect(aggregateCandles([], 5)).toEqual([]);
+  });
+
+  it('treats a missing volume as zero rather than NaN', () => {
+    const out = aggregateCandles([{ ts: base, open: 1, high: 1, low: 1, close: 1 }], 5);
+    expect(out[0].volumeUsd).toBe(0);
   });
 });

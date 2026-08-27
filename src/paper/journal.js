@@ -45,6 +45,15 @@ export const BOOK_TRADE_TAIL = 20;
  */
 export const SERIES_CAP = 240;
 
+/**
+ * Candles kept per mint when folding the journal.
+ *
+ * 300 one-minute candles is five hours, which is longer than any position this
+ * strategy holds (the time stop is 45 minutes) and enough to aggregate into
+ * hour bars. Bounded here so the cost never reaches the renderer.
+ */
+export const CANDLE_CAP = 300;
+
 const ISO_DATE_LENGTH = 10;
 
 /** UTC day bucket, so a file boundary is the same wherever the bot runs. */
@@ -59,7 +68,7 @@ export const journalFile = (ts) => `${new Date(ts).toISOString().slice(0, ISO_DA
  * @param {Record<string,string>} [p.symbols] mint -> symbol, for display only
  * @returns {object} one JSONL record
  */
-export function buildBookRecord({ ts, portfolio, equityUsd, symbols = {} }) {
+export function buildBookRecord({ ts, portfolio, equityUsd, symbols = {}, pools = {} }) {
   return {
     schemaVersion: JOURNAL.schemaVersion,
     type: 'book',
@@ -85,6 +94,10 @@ export function buildBookRecord({ ts, portfolio, equityUsd, symbols = {} }) {
     positions: Object.entries(portfolio.positions).map(([mint, p]) => ({
       mint,
       symbol: symbols[mint] ?? null,
+      // The AMM pool, which is what the OHLCV endpoint is keyed by. Carried here
+      // because the portfolio does not know it -- a position is a mint and a
+      // size, and the pool is a market detail that only the fetcher sees.
+      pairAddress: pools[mint] ?? null,
       sizeUsd: p.sizeUsd,
       qty: p.qty,
       entryPriceUsd: p.entryPriceUsd,
@@ -101,6 +114,43 @@ export function buildBookRecord({ ts, portfolio, equityUsd, symbols = {} }) {
       netPnlUsd: t.netPnlUsd,
       reason: t.reason,
       closedTs: t.closedTs,
+    })),
+  };
+}
+
+/**
+ * Shape a candles record: real OHLCV for one mint.
+ *
+ * A separate line type rather than a field on the book, because candles arrive on
+ * their own schedule and the book must stay small enough to rewrite on every
+ * change. Only NEW candles are ever passed here, so this is a delta and the file
+ * grows by roughly one candle a minute per open position.
+ *
+ * The newest candle of a live minute is still forming and will be superseded by
+ * a later line carrying the same timestamp; readJournal resolves that by keeping
+ * the LAST one seen for a timestamp, which is the more complete version.
+ *
+ * @param {object} p
+ * @param {number} p.ts when this was fetched
+ * @param {string} p.mint
+ * @param {readonly object[]} p.candles normalised {ts,open,high,low,close,volumeUsd}
+ */
+export function buildCandlesRecord({ ts, mint, candles }) {
+  return {
+    schemaVersion: JOURNAL.schemaVersion,
+    type: 'candles',
+    ts,
+    iso: new Date(ts).toISOString(),
+    mint,
+    /** Always one-minute bars. Longer intervals are aggregated by the reader. */
+    intervalMinutes: 1,
+    candles: candles.map((c) => ({
+      ts: c.ts,
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+      volumeUsd: c.volumeUsd ?? null,
     })),
   };
 }
@@ -177,6 +227,7 @@ export function readJournal(lines) {
   let book = null;
   const trades = [];
   const series = new Map();
+  const candles = new Map();
   let malformed = 0;
 
   for (const line of lines) {
@@ -211,6 +262,16 @@ export function readJournal(lines) {
       }
     } else if (record.type === 'trade') {
       trades.push(record);
+    } else if (record.type === 'candles') {
+      const byTs = candles.get(record.mint) ?? new Map();
+      for (const c of Array.isArray(record.candles) ? record.candles : []) {
+        if (!Number.isFinite(c?.ts) || !Number.isFinite(c?.close)) continue;
+        // LAST write wins for a timestamp. The final minute of any fetch is still
+        // forming, so a later line carrying the same ts is the more complete
+        // candle, not a duplicate to discard.
+        byTs.set(c.ts, c);
+      }
+      candles.set(record.mint, byTs);
     }
   }
 
@@ -226,10 +287,19 @@ export function readJournal(lines) {
     cleaned.set(mint, Object.freeze([...seen.values()].slice(-SERIES_CAP)));
   }
 
+  const candlesByMint = new Map();
+  for (const [mint, byTs] of candles) {
+    candlesByMint.set(
+      mint,
+      Object.freeze([...byTs.values()].sort((x, y) => x.ts - y.ts).slice(-CANDLE_CAP)),
+    );
+  }
+
   return Object.freeze({
     book,
     trades: Object.freeze(trades),
     series: cleaned,
+    candles: candlesByMint,
     malformed,
     // Present but empty is a different state from absent, and the UI must be able
     // to tell "the bot is running and flat" from "the bot has never run".

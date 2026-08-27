@@ -102,20 +102,22 @@ const SCAN_PAGE_SECONDS = 4;
  * default old-space ceiling is about 4GB, so warn at 1.5 and get loud at 2.8.
  */
 /**
- * Chart windows, and the honest caveat attached to them.
+ * Candle intervals, and the one caveat that remains.
  *
- * A one-second chart was asked for and cannot be built. Every price on this
- * screen comes from the bot's publish, the bot cycles once a MINUTE, and the
- * upstream feed is not per-second either -- so one point a minute is the floor
- * for the whole system. Drawing a 1s axis over 60s samples would be a picture of
- * data that does not exist. These are windows over real points instead, and the
- * chart states its own resolution.
+ * These are real OHLCV bars: the bot fetches one-minute candles for every open
+ * position and the longer intervals are aggregated from them, so 5m and 15m cost
+ * no extra request. Volume, high and low are genuine market data, not the bot's
+ * own sampling.
+ *
+ * A one-second chart was asked for and still cannot be built -- GeckoTerminal's
+ * finest bar is a minute and no public Solana DEX feed publishes tick data. One
+ * minute is the floor, and the chart says so rather than implying otherwise.
  */
 const WINDOWS = Object.freeze([
-  { key: '15m', ms: 15 * 60_000 },
-  { key: '1h', ms: 60 * 60_000 },
-  { key: '6h', ms: 6 * 60 * 60_000 },
-  { key: 'all', ms: Infinity },
+  { key: '1m', minutes: 1 },
+  { key: '5m', minutes: 5 },
+  { key: '15m', minutes: 15 },
+  { key: '1h', minutes: 60 },
 ]);
 
 /** History groupings. Each is a submenu over the same list. */
@@ -149,7 +151,7 @@ is safe to leave running next to the recorder and the bot.
   --paper-dir P  the bot's journal directory (default ${JOURNAL.dir})
   --cols N     force a width instead of asking the terminal
   --detail     open the detail panel on the first row immediately
-  --window W   chart window: 15m | 1h | 6h | all
+  --window W   candle interval: 1m | 5m | 15m | 1h
 
   1 2 3 4      switch view        <- / ->     also switch
   up / down    move selection     enter/space  open the detail panel
@@ -339,6 +341,48 @@ export function groupCounts(history, config) {
 }
 
 /**
+ * Roll one-minute bars up into a longer interval.
+ *
+ * Open from the first bar, close from the last, high and low across all of them,
+ * volume summed -- which is what an interval bar means. Bucketed on absolute
+ * epoch minutes rather than relative to the newest candle, so a bar covers the
+ * same wall-clock window every time it is drawn and does not shift under the eye
+ * as new data arrives.
+ *
+ * @param {readonly object[]} candles one-minute bars, oldest first
+ * @param {number} minutes target interval
+ */
+export function aggregateCandles(candles, minutes) {
+  if (minutes <= 1) return candles;
+  const span = minutes * 60_000;
+  const buckets = new Map();
+  for (const c of candles) {
+    const key = Math.floor(c.ts / span) * span;
+    const acc = buckets.get(key);
+    if (acc === undefined) {
+      buckets.set(key, { ts: key, open: c.open, high: c.high, low: c.low, close: c.close, volumeUsd: c.volumeUsd ?? 0 });
+      continue;
+    }
+    acc.high = Math.max(acc.high, c.high);
+    acc.low = Math.min(acc.low, c.low);
+    acc.close = c.close;
+    acc.volumeUsd += c.volumeUsd ?? 0;
+  }
+  return [...buckets.values()].sort((x, y) => x.ts - y.ts);
+}
+
+/** A book-derived point has no range, so it becomes a flat bar. */
+const pointsToCandles = (points) =>
+  points.map((pt) => ({
+    ts: pt.ts,
+    open: pt.priceUsd,
+    high: pt.priceUsd,
+    low: pt.priceUsd,
+    close: pt.priceUsd,
+    volumeUsd: null,
+  }));
+
+/**
  * A price chart in block characters.
  *
  * Coloured PER ROW rather than per column, which is not a shortcut: a row is one
@@ -352,44 +396,43 @@ export function groupCounts(history, config) {
  * @param {number} p.width
  * @param {number} [p.height]
  */
-function Chart({ points, entryUsd, width, height = 7 }) {
+function Chart({ bars: candles, entryUsd, width, height = 8, interval, real }) {
   const cols = Math.max(8, width - 24);
-  if (points.length === 0) {
-    return h(Text, { dimColor: true }, 'no price points in this window yet');
-  }
-  if (points.length === 1) {
-    return h(
-      Text,
-      { dimColor: true },
-      `one point so far (${price(points[0].priceUsd)}) — a line needs two`,
-    );
+  if (candles.length === 0) {
+    return h(Text, { dimColor: true }, 'no candles for this interval yet');
   }
 
-  // Sample to the available columns. Fewer points than columns draws them all.
-  const step = points.length <= cols ? 1 : (points.length - 1) / (cols - 1);
-  const sampled =
-    points.length <= cols
-      ? points
-      : Array.from({ length: cols }, (_, i) => points[Math.round(i * step)]);
-  const vals = sampled.map((pt) => pt.priceUsd);
-  // The entry price is inside the range on purpose, so its line is always drawn
-  // rather than clipped off the top or bottom when the position only moved away.
-  const withEntry = Number.isFinite(entryUsd) ? [...vals, entryUsd] : vals;
-  const lo = Math.min(...withEntry);
-  const hi = Math.max(...withEntry);
+  // Newest-biased: when there are more bars than columns, the RECENT ones are
+  // what matter, so this drops the oldest rather than sampling across the whole
+  // history and blurring the last few minutes.
+  const shown = candles.slice(-cols);
+  const highs = shown.map((c) => c.high);
+  const lows = shown.map((c) => c.low);
+  const range = Number.isFinite(entryUsd) ? [...highs, ...lows, entryUsd] : [...highs, ...lows];
+  const hi = Math.max(...range);
+  const lo = Math.min(...range);
   const span = hi - lo || 1;
   const rowOf = (v) => Math.min(height - 1, Math.max(0, Math.round(((hi - v) / span) * (height - 1))));
   const entryRow = Number.isFinite(entryUsd) ? rowOf(entryUsd) : -1;
 
-  const grid = Array.from({ length: height }, () => new Array(sampled.length).fill(' '));
-  sampled.forEach((pt, i) => {
-    grid[rowOf(pt.priceUsd)][i] = '█';
+  const grid = Array.from({ length: height }, () => new Array(shown.length).fill(' '));
+  shown.forEach((c, i) => {
+    const hiRow = rowOf(c.high);
+    const loRow = rowOf(c.low);
+    const bodyTop = rowOf(Math.max(c.open, c.close));
+    const bodyBottom = rowOf(Math.min(c.open, c.close));
+    // Wick first, body over it: a real candle, so the high and low are visible
+    // rather than implied by a single close price.
+    for (let r = hiRow; r <= loRow; r += 1) grid[r][i] = '\u2502';
+    for (let r = bodyTop; r <= bodyBottom; r += 1) grid[r][i] = '\u2588';
   });
   if (entryRow >= 0) {
-    for (let i = 0; i < sampled.length; i += 1) if (grid[entryRow][i] === ' ') grid[entryRow][i] = '─';
+    for (let i = 0; i < shown.length; i += 1) if (grid[entryRow][i] === ' ') grid[entryRow][i] = '\u2500';
   }
 
-  const spanMin = Math.round((sampled.at(-1).ts - sampled[0].ts) / 60_000);
+  const spanMin = Math.max(1, Math.round((shown.at(-1).ts - shown[0].ts) / 60_000));
+  const vol = shown.reduce((n, c) => n + (c.volumeUsd ?? 0), 0);
+
   return h(
     Box,
     { flexDirection: 'column' },
@@ -401,8 +444,10 @@ function Chart({ points, entryUsd, width, height = 7 }) {
           Text,
           {
             wrap: 'truncate',
-            // Above the entry row is a higher price, so green; below is red. The
-            // entry row itself is neither.
+            // Per ROW, which is not a shortcut: a row is one price level, so every
+            // candle touching it sits on the same side of the entry price. That
+            // makes one Text per row correct as well as cheap, and cheap matters
+            // where Ink leaks per rendered node.
             color: entryRow < 0 ? 'cyan' : r < entryRow ? 'green' : r > entryRow ? 'red' : 'gray',
             dimColor: r === entryRow,
           },
@@ -411,10 +456,9 @@ function Chart({ points, entryUsd, width, height = 7 }) {
         h(
           Text,
           { dimColor: true, wrap: 'truncate' },
-          // Labels ACCUMULATE rather than take priority. When a position has only
-          // moved one way the entry price IS the high or the low, and an
-          // either/or chain silently dropped the entry label exactly when the
-          // reference line mattered most.
+          // Labels ACCUMULATE. When a position has only moved one way the entry
+          // price IS the high or the low, and an either/or chain dropped the entry
+          // label exactly when the reference line mattered most.
           [
             r === 0 ? price(hi) : null,
             r === height - 1 ? price(lo) : null,
@@ -428,9 +472,12 @@ function Chart({ points, entryUsd, width, height = 7 }) {
     ),
     h(
       Text,
-      { dimColor: true },
-      `${sampled.length} point${sampled.length === 1 ? '' : 's'} over ${spanMin}m · ` +
-        'one per bot cycle (60s) — the finest this data has',
+      { dimColor: true, wrap: 'truncate' },
+      real
+        ? `${shown.length} x ${interval} candles · ${spanMin}m · vol ${usdShort(vol)} · ` +
+          'GeckoTerminal OHLCV, 1m is the finest published'
+        : `${shown.length} points over ${spanMin}m · the bot's own marks, no candles yet ` +
+          '(no high or low)',
     ),
   );
 }
@@ -1020,15 +1067,21 @@ export function positionRows(book, trades) {
   ];
 }
 
-/** Points inside the selected window, oldest first. */
-function windowed(series, mint, ms, now) {
-  const all = series[mint] ?? [];
-  if (!Number.isFinite(ms)) return all;
-  return all.filter((pt) => now - pt.ts <= ms);
+/**
+ * The bars to draw for one mint, and whether they are real market candles.
+ *
+ * Prefers the fetched OHLCV and falls back to the bot's own marks, which have no
+ * high or low. The distinction is returned rather than hidden, because a chart
+ * built from 60-second samples should not be presented as a candle chart.
+ */
+function barsFor({ candles, series, mint, minutes }) {
+  const real = candles[mint] ?? [];
+  if (real.length > 0) return { bars: aggregateCandles(real, minutes), real: true };
+  return { bars: aggregateCandles(pointsToCandles(series[mint] ?? []), minutes), real: false };
 }
 
 /** Everything around one open position, including how close it is to an exit. */
-function OpenDetail({ row, series, window: win, nowMs, config, width }) {
+function OpenDetail({ row, series, candles, window: win, nowMs, config, width }) {
   const p = row.pos;
   const movePct =
     Number.isFinite(p.lastPriceUsd) && p.entryPriceUsd > 0
@@ -1056,9 +1109,15 @@ function OpenDetail({ row, series, window: win, nowMs, config, width }) {
       h(Text, { dimColor: true }, `${WINDOWS.map((w) => (w.key === win ? `[${w.key}]` : w.key)).join(' ')}  t`),
     ),
     h(Chart, {
-      points: windowed(series, row.mint, WINDOWS.find((w) => w.key === win)?.ms ?? Infinity, nowMs),
+      ...barsFor({
+        candles,
+        series,
+        mint: row.mint,
+        minutes: WINDOWS.find((w) => w.key === win)?.minutes ?? 1,
+      }),
       entryUsd: p.entryPriceUsd,
       width,
+      interval: win,
     }),
     h(Text, null, ''),
     h(Field, { label: 'entry' }, `${price(p.entryPriceUsd)}   size ${money(p.sizeUsd)}`),
@@ -1099,7 +1158,7 @@ function OpenDetail({ row, series, window: win, nowMs, config, width }) {
 }
 
 /** Everything around one closed trade. */
-function ClosedDetail({ row, series, window: win, nowMs, width }) {
+function ClosedDetail({ row, series, candles, window: win, nowMs, width }) {
   const t = row.trade;
   return h(
     Box,
@@ -1117,9 +1176,15 @@ function ClosedDetail({ row, series, window: win, nowMs, width }) {
       h(Text, { dimColor: true }, `${WINDOWS.map((w) => (w.key === win ? `[${w.key}]` : w.key)).join(' ')}  t`),
     ),
     h(Chart, {
-      points: windowed(series, row.mint, WINDOWS.find((w) => w.key === win)?.ms ?? Infinity, nowMs),
+      ...barsFor({
+        candles,
+        series,
+        mint: row.mint,
+        minutes: WINDOWS.find((w) => w.key === win)?.minutes ?? 1,
+      }),
       entryUsd: t.entryPriceUsd,
       width,
+      interval: win,
     }),
     h(Text, null, ''),
     h(Field, { label: 'in then out' }, `${price(t.entryPriceUsd)}  to  ${price(t.exitPriceUsd)}`),
@@ -1150,7 +1215,7 @@ function ClosedDetail({ row, series, window: win, nowMs, width }) {
  * a second brain, and two brains eventually disagree about money.
  */
 function PositionsView({ data, rows, width, selected, showDetail, canType, nowMs, window: win }) {
-  const { hasBook, book, trades, series } = data.paper;
+  const { hasBook, book, trades, series, candles } = data.paper;
 
   if (!hasBook) {
     return h(
@@ -1263,12 +1328,13 @@ function PositionsView({ data, rows, width, selected, showDetail, canType, nowMs
           ? h(OpenDetail, {
               row: detail,
               series,
+              candles,
               window: win,
               nowMs,
               config: data.config,
               width: width - 6,
             })
-          : h(ClosedDetail, { row: detail, series, window: win, nowMs, width: width - 6 }),
+          : h(ClosedDetail, { row: detail, series, candles, window: win, nowMs, width: width - 6 }),
       ),
   );
 }

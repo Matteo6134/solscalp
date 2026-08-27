@@ -25,6 +25,7 @@
 import pLimit from 'p-limit';
 import { MODES, NOTIFY, RECORDER, RISK, SAFETY, STRATEGY, UNIVERSE_PROFILES } from '../src/config.js';
 import { getBestPairs } from '../src/data/dexscreener.js';
+import { getOhlcv } from '../src/data/geckoterminal.js';
 import { getNewPools, getTopPools, getTrendingPools } from '../src/data/geckoterminal.js';
 import { loadEnv } from '../src/env.js';
 import {
@@ -51,7 +52,12 @@ import {
   universeReasons,
 } from '../src/paper/engine.js';
 import { emptyPortfolio, portfolioEquityUsd } from '../src/paper/portfolio.js';
-import { appendJournal, buildBookRecord, buildTradeRecord } from '../src/paper/journal.js';
+import {
+  appendJournal,
+  buildBookRecord,
+  buildCandlesRecord,
+  buildTradeRecord,
+} from '../src/paper/journal.js';
 import { recheckGate, runGate } from '../src/safety/index.js';
 import { describeError } from '../src/rpc/rpc-errors.js';
 import { JOURNAL } from '../src/config.js';
@@ -59,6 +65,14 @@ import { EXIT, buildRpc, intFlag, isMain, parseArgs, runMain, say } from './lib/
 import { costsFor, solPriceFrom } from './lib/liveCosts.js';
 
 const GATE_CONCURRENCY = 3;
+/**
+ * One-minute bars fetched per position per cycle.
+ *
+ * 300 is five hours, comfortably longer than the 45-minute time stop, and enough
+ * history to aggregate into hour bars. One request either way, so the only cost
+ * of asking for more is the bytes.
+ */
+const CANDLE_FETCH = 300;
 const MS_PER_SECOND = 1_000;
 
 const USAGE = `usage: npm run bot -- [--interval S] [--feed F] [--early] [--paper]
@@ -406,6 +420,11 @@ export async function cycle({ state, notifier, deps, universe, paperEnabled, lim
   }
 
   const symbolOf = new Map(pairs.map((p) => [p.mint, p.baseToken?.symbol ?? null]));
+  // mint -> AMM pool, which is the key the OHLCV endpoint wants. Plain object
+  // because it is written straight into a JSON record.
+  const poolOf = Object.fromEntries(
+    pairs.filter((p) => typeof p.pairAddress === 'string').map((p) => [p.mint, p.pairAddress]),
+  );
 
   // A held token failing its recheck is the most urgent thing this bot can say.
   for (const [mint, recheck] of Object.entries(gateRechecks)) {
@@ -450,10 +469,11 @@ export async function cycle({ state, notifier, deps, universe, paperEnabled, lim
       costs,
       universe,
     });
+    await publishCandles({ state, held, poolOf, at, dir: paperDir, deps });
     // PUBLISH BEFORE NOTIFYING. Telegram used to be the only place a fill
     // appeared, which made the notifier the de-facto record -- so a Telegram
     // outage lost the trade. The journal is written first and unconditionally.
-    await publishBook({ state, before, symbolOf, at, dir: paperDir, deps });
+    await publishBook({ state, before, symbolOf, pools: poolOf, at, dir: paperDir, deps });
     await announceActions({ state, notifier, before, symbolOf, at });
   }
 
@@ -485,6 +505,57 @@ export async function cycle({ state, notifier, deps, universe, paperEnabled, lim
 }
 
 /**
+ * Real OHLCV for every open position, appended as it arrives.
+ *
+ * The chart used to be drawn from the bot's own marks -- one point per 60-second
+ * cycle, no high, no low, no volume. This is the actual market data behind that
+ * price, at one-minute resolution, which is the finest any public Solana DEX feed
+ * publishes. Longer intervals are aggregated by the reader from these, so asking
+ * for 5m or 15m costs no extra request.
+ *
+ * The dashboard still fetches nothing. One fetcher per upstream is the rule that
+ * keeps this project inside its rate limits, and the bot already owns the
+ * per-position fetch.
+ *
+ * Bounded and non-fatal: at most one request per open position per cycle, only
+ * for positions whose pool is known, and a failure leaves the chart on its
+ * fallback rather than interrupting the cycle.
+ */
+export async function publishCandles({ state, held, poolOf, at, dir, deps = {} }) {
+  if (held.length === 0) return;
+  const fetchOhlcv = deps.fetchOhlcv ?? getOhlcv;
+  state.lastCandleTs ??= {};
+  const records = [];
+
+  for (const mint of held) {
+    const poolAddress = poolOf[mint];
+    if (typeof poolAddress !== 'string') continue;
+    let candles;
+    try {
+      candles = await fetchOhlcv({ poolAddress, timeframe: 'minute', aggregate: 1, limit: CANDLE_FETCH });
+    } catch (err) {
+      say(`[candles] ${mint.slice(0, 8)}: ${describeError(err)}`);
+      continue;
+    }
+    if (!Array.isArray(candles) || candles.length === 0) continue;
+    // Only what is new, PLUS the last one already seen -- that bar was still
+    // forming when it was written and its high, low and close have moved since.
+    const since = state.lastCandleTs[mint] ?? 0;
+    const fresh = candles.filter((c) => Number.isFinite(c?.ts) && c.ts >= since);
+    if (fresh.length === 0) continue;
+    state.lastCandleTs[mint] = fresh.at(-1).ts;
+    records.push(buildCandlesRecord({ ts: at, mint, candles: fresh }));
+  }
+
+  if (records.length === 0) return;
+  try {
+    await appendJournal(records, { dir }, deps);
+  } catch (err) {
+    say(`[candles] could not write: ${describeError(err)}`);
+  }
+}
+
+/**
  * Write the book to disk whenever it changed.
  *
  * Guarded, and deliberately non-fatal: a full disk or a locked file must not stop
@@ -492,7 +563,7 @@ export async function cycle({ state, notifier, deps, universe, paperEnabled, lim
  * because a silently un-journalled book is the exact failure this module exists
  * to remove.
  */
-export async function publishBook({ state, before, symbolOf, at, dir, deps = {} }) {
+export async function publishBook({ state, before, symbolOf, pools = {}, at, dir, deps = {} }) {
   const after = state.engine.portfolio;
   // Cheap change test. Marks move unrealised P&L every cycle, so comparing the
   // whole object would append on every tick and turn the journal into a log of
@@ -508,7 +579,13 @@ export async function publishBook({ state, before, symbolOf, at, dir, deps = {} 
 
   const symbols = Object.fromEntries(symbolOf);
   const records = [
-    buildBookRecord({ ts: at, portfolio: after, equityUsd: portfolioEquityUsd(after), symbols }),
+    buildBookRecord({
+      ts: at,
+      portfolio: after,
+      equityUsd: portfolioEquityUsd(after),
+      symbols,
+      pools,
+    }),
   ];
   // One durable line per newly closed trade. Counting the delta rather than
   // reading actions means a close is journalled even if the action list is

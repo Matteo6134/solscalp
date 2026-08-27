@@ -187,6 +187,9 @@ export async function buildDashData({ dir = RECORDER.dir, journalDir = JOURNAL.d
       // A Map would work, but the payload is frozen and compared by identity in
       // the UI; a plain object keeps it consistent with everything else here.
       series: Object.freeze(Object.fromEntries(journal.series)),
+      // Real OHLCV, fetched by the bot. The chart prefers these; the book-derived
+      // series above is the fallback for a position whose candles never arrived.
+      candles: Object.freeze(Object.fromEntries(journal.candles)),
     }),
     evidence: Object.freeze({
       tally,
@@ -233,6 +236,7 @@ export const EMPTY = Object.freeze({
     book: null,
     trades: Object.freeze([]),
     series: Object.freeze({}),
+    candles: Object.freeze({}),
   }),
   evidence: Object.freeze({
     tally: Object.freeze({
