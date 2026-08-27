@@ -19,6 +19,37 @@
  *   Ink's input hook independently of the read timer. So the interface cannot be
  *   blocked by a slow Solana RPC, because it never talks to one.
  *
+ * THE MOVEMENT IS REAL, AND THAT IS THE POINT
+ *   Every moving thing on this screen is driven by recorded data or by the clock,
+ *   never by an animation standing in for activity. The scan feed pages through
+ *   pairs the recorder actually fetched and rejected; the countdown is arithmetic
+ *   on the snapshot timestamp; the spinner stops when the recorder goes stale. A
+ *   spinner that keeps turning after the data stops is a lie, and this screen's
+ *   whole job is to be trusted about whether anything is happening.
+ *
+ * IT MUST SURVIVE BEING LEFT OPEN, AND ONCE IT DID NOT
+ *   A run of about 2.7 hours died with "Ineffective mark-compacts near heap
+ *   limit" at ~4GB. Bisected by measurement, not by reading:
+ *
+ *     buildDashData          240 sequential calls, heap flat at ~9MB   NOT IT
+ *     patchConsole: false    identical growth                          NOT IT
+ *     unmount + remount      283MB vs 303MB, no reclaim                NOT IT
+ *     1 row vs 60 rows       flat vs linear growth                     <-- HERE
+ *
+ *   Ink 7.1.1 retains roughly 1.6KB per Box PER RENDER, module-level, surviving
+ *   unmount. Measured 8.2 GB/hour for 600 boxes re-rendered five times a second,
+ *   and it is not the text cache: identical text still leaked 8.1 GB/hour.
+ *
+ *   So the fix is to stop re-rendering things that have not changed. React.memo
+ *   on the view subtrees took the same benchmark from 8208 MB/hour to 45, a 182x
+ *   reduction, because a memoized subtree React skips is a subtree Ink never
+ *   rebuilds. Two more cuts stack on top: the read loop no longer pushes state
+ *   when the data is unchanged, and the animation clock ticks once a second
+ *   rather than five times.
+ *
+ *   This is a mitigation of an upstream bug, not a repair of it. The residual is
+ *   small but not zero, so a dashboard left open for weeks will still grow.
+ *
  * IT REMEMBERS
  *   The recording is the history. Closing this window loses nothing, and a
  *   restart re-reads hours of ticks and every sighting of every token.
@@ -30,14 +61,56 @@
  */
 
 import { Box, Text, render, useApp, useInput, useStdin } from 'ink';
-import { createElement as h, useEffect, useState } from 'react';
-import { RECORDER } from '../src/config.js';
+import { createElement as h, memo, useEffect, useRef, useState } from 'react';
+import { JOURNAL, RECORDER } from '../src/config.js';
 import { EMPTY, buildDashData } from './lib/dashData.js';
 import { EXIT, intFlag, isMain, parseArgs, runMain } from './lib/cli.js';
 
 const MS_PER_SECOND = 1_000;
-const VIEWS = Object.freeze(['live', 'history', 'evidence']);
+const VIEWS = Object.freeze(['live', 'positions', 'history', 'evidence']);
 const BLOCKS = Object.freeze(['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']);
+const SPINNER = Object.freeze(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']);
+
+/**
+ * Animation cadence. One second, which is as fine as anything here needs: the
+ * countdown is in whole seconds and the recorder ticks once a minute.
+ *
+ * It was 200ms. Five times the frame rate is five times the leak above for a
+ * spinner nobody is timing, and a once-a-second pulse arguably reads better --
+ * it beats at the rate data actually arrives rather than implying more.
+ */
+const FRAME_MS = 1_000;
+/** Seconds the scan feed holds one page before turning to the next. */
+const SCAN_PAGE_SECONDS = 4;
+
+/**
+ * Rows spent outside the panel, each one CLIPPED to the stated height so the
+ * total is a fact rather than an estimate. Every earlier version of this budget
+ * guessed, and the guess was wrong at the edges: a wrapped status line, a wrapped
+ * hint, a detail panel whose height depends on the width.
+ */
+/**
+ * Heap levels at which this screen starts telling on itself.
+ *
+ * Ink's per-render leak is mitigated, not cured: measured ~150 MB/hour against
+ * the live recording, down from the ~1,500 MB/hour that killed a 2.7-hour run at
+ * 4GB. So the process still has a finite life, and the previous behaviour on
+ * reaching it was to die with a V8 stack trace -- from the operator's side,
+ * indistinguishable from the market going quiet.
+ *
+ * A dashboard that knows it is dying should say so while it still can. Node's
+ * default old-space ceiling is about 4GB, so warn at 1.5 and get loud at 2.8.
+ */
+const HEAP_WARN_MB = 1_500;
+const HEAP_URGENT_MB = 2_800;
+
+const CHROME = Object.freeze({
+  header: 2,
+  nav: 1,
+  footer: 1,
+  /** header + nav + footer + two border rows + two marginTop rows. */
+  total: 8,
+});
 
 const USAGE = `usage: npm run dash -- [--refresh S] [--view V] [--dir PATH]
 
@@ -45,11 +118,15 @@ One screen over the recorder's output. Makes no network calls of its own, so it
 is safe to leave running next to the recorder and the bot.
 
   --refresh S  seconds between reads (default 3)
-  --view V     start on live | history | evidence
+  --view V     start on live | positions | history | evidence
   --dir PATH   recordings directory (default ${RECORDER.dir})
+  --paper-dir P  the bot's journal directory (default ${JOURNAL.dir})
+  --cols N     force a width instead of asking the terminal
+  --detail     open the detail panel on the first row immediately
 
-  1 / 2 / 3    switch view        <- / ->   also switch
-  r            re-read now        q         quit
+  1 2 3 4      switch view        <- / ->     also switch
+  r            re-read now        q           quit
+  up / down    move selection     enter/space token details
 `;
 
 /* ------------------------------------------------------------------ format */
@@ -61,11 +138,46 @@ const usd = (n) =>
       ? `$${n.toFixed(4)}`
       : `$${Math.round(n).toLocaleString('en-US')}`;
 
+/**
+ * A signed amount of money: -$8.40, +$1,204, $0.00.
+ *
+ * `usd` is built for PRICES, so it switches to four decimals under $10 -- which
+ * rendered a P&L of -8.4 as "$-8.4000", with the minus sign inside the currency
+ * and four decimals of false precision on a dollar figure. Money that can be
+ * negative needs its own formatter.
+ */
+const money = (n, signed = false) => {
+  if (n === null || n === undefined || !Number.isFinite(n)) return '—';
+  const a = Math.abs(n);
+  const body = a < 10 ? a.toFixed(2) : Math.round(a).toLocaleString('en-US');
+  const sign = n < 0 ? '-' : signed ? '+' : '';
+  return `${sign}$${body}`;
+};
+
 const pct = (n) =>
   n === null || n === undefined || !Number.isFinite(n) ? '—' : `${n >= 0 ? '+' : ''}${n.toFixed(1)}%`;
 
-const num = (n, d = 1) =>
-  n === null || n === undefined || !Number.isFinite(n) ? '—' : n.toFixed(d);
+/**
+ * Money at a glance: $12.6M, $594k, $26.83.
+ *
+ * The scan feed is a dozen rows of numbers read at a glance, and full figures
+ * collided there -- "$12,578,200" is 11 characters, exactly the column width, so
+ * it ran straight into the next value with no gap at all. Precision is not what
+ * that column is for; the detail panel carries the exact figure.
+ */
+const usdShort = (n) => {
+  if (n === null || n === undefined || !Number.isFinite(n)) return '—';
+  const a = Math.abs(n);
+  if (a >= 1e9) return `$${(n / 1e9).toFixed(1)}B`;
+  if (a >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
+  if (a >= 1e3) return `$${Math.round(n / 1e3)}k`;
+  return `$${n.toFixed(2)}`;
+};
+
+const num = (n, d = 1) => (n === null || n === undefined || !Number.isFinite(n) ? '—' : n.toFixed(d));
+
+const clock = (ts) =>
+  ts === null || ts === undefined ? '—' : new Date(ts).toISOString().slice(11, 19) + 'Z';
 
 /** Colour by how far the pool has fallen. Semantic, not decorative. */
 function tone(change) {
@@ -81,9 +193,7 @@ function sparkline(series, width = 12, minPoints = 4) {
   if (pts.length < minPoints) return '';
   const step = pts.length <= width ? 1 : (pts.length - 1) / (width - 1);
   const sampled =
-    pts.length <= width
-      ? pts
-      : Array.from({ length: width }, (_, i) => pts[Math.round(i * step)]);
+    pts.length <= width ? pts : Array.from({ length: width }, (_, i) => pts[Math.round(i * step)]);
   const vals = sampled.map((p) => p.liq);
   const lo = Math.min(...vals);
   const span = Math.max(...vals) - lo;
@@ -120,13 +230,55 @@ export function fitColumns(cols, budget) {
   return cols.filter((c) => chosen.includes(c));
 }
 
+/**
+ * Which slice of a rotating list is on screen.
+ *
+ * Split out from the component so the rotation is testable without a terminal,
+ * and so the guarantees are stated once: a list that fits never moves (movement
+ * you cannot stop is worse than no movement when you are trying to read), and
+ * the offset is always a whole page, so rows never slide under the eye.
+ *
+ * Takes a PAGE tick rather than an animation frame. The distinction is what lets
+ * the feed be memoized: a frame counter changes every second and would rebuild
+ * the whole table each time, where the page tick changes only when the visible
+ * rows genuinely differ.
+ *
+ * @param {number} total items in the list
+ * @param {number} page rows visible
+ * @param {number} tick monotonic page counter
+ * @returns {{start: number, pages: number, at: number}}
+ */
+export function rotate(total, page, tick) {
+  const size = Math.max(1, page);
+  const pages = Math.max(1, Math.ceil(total / size));
+  const at = pages <= 1 ? 0 : ((tick % pages) + pages) % pages;
+  return { start: at * size, pages, at };
+}
 
 /** A fixed-width cell. Ink truncates, so no manual width arithmetic. */
 const Cell = ({ w, children, ...rest }) =>
   h(Box, { width: w, flexShrink: 0 }, h(Text, { wrap: 'truncate', ...rest }, children));
 
-const Head = ({ w, children }) =>
-  h(Cell, { w, dimColor: true, bold: true }, children);
+const Head = ({ w, children }) => h(Cell, { w, dimColor: true, bold: true }, children);
+
+/**
+ * The two places worth opening for a token.
+ *
+ * These WRAP rather than truncate, unlike every other field on screen. A
+ * truncated number is still informative; a truncated address or URL is worse
+ * than absent, because it looks copyable and is not.
+ */
+const Links = ({ mint }) =>
+  h(
+    Box,
+    { flexDirection: 'column' },
+    h(Text, { dimColor: true, wrap: 'wrap' }, `chart    https://dexscreener.com/solana/${mint}`),
+    h(Text, { dimColor: true, wrap: 'wrap' }, `holders  https://solscan.io/token/${mint}`),
+  );
+
+/** A label/value line for the detail panel. */
+const Field = ({ label, children, ...rest }) =>
+  h(Box, null, h(Cell, { w: 16, dimColor: true }, label), h(Text, { wrap: 'truncate', ...rest }, children));
 
 /* -------------------------------------------------------------------- views */
 
@@ -138,8 +290,7 @@ function ActivityStrip({ ticks, width }) {
     ticks.length <= w ? ticks : Array.from({ length: w }, (_, i) => ticks[Math.round(i * step)]);
   const max = Math.max(1, ...sampled.map((t) => t.seen));
   const hits = ticks.filter((t) => t.safe > 0).length;
-  const spanH =
-    ticks.length > 1 ? (ticks[ticks.length - 1].ts - ticks[0].ts) / 3_600_000 : 0;
+  const spanH = ticks.length > 1 ? (ticks[ticks.length - 1].ts - ticks[0].ts) / 3_600_000 : 0;
 
   return h(
     Box,
@@ -158,12 +309,211 @@ function ActivityStrip({ ticks, width }) {
     h(
       Text,
       { dimColor: true },
-      `${ticks.length} scans over ${spanH.toFixed(1)}h · ${hits} found something the gate passed`,
+      `${ticks.length} scan${ticks.length === 1 ? '' : 's'} over ${spanH.toFixed(1)}h · ` +
+        `${hits} found something the gate passed`,
     ),
   );
 }
 
-function LiveView({ data, width }) {
+/**
+ * The scan feed: every pair the newest tick fetched, rejects included.
+ *
+ * This exists because the interface used to look dead. The screen only ever
+ * showed tokens that PASSED the universe screen, and on a typical tick nothing
+ * does -- measured 19 pairs fetched, 3 passed, and on many ticks zero. An empty
+ * table is indistinguishable from a crashed recorder, so the operator had no way
+ * to tell hard work from no work.
+ *
+ * It pages rather than scrolls, because a list sliding continuously under the eye
+ * cannot be read, and it holds still entirely when everything fits.
+ */
+function ScanFeed({ scanned, pageTick, rows, live, width }) {
+  if (scanned.length === 0) {
+    return h(
+      Box,
+      { flexDirection: 'column' },
+      h(Text, { dimColor: true, wrap: 'wrap' }, 'No scan feed in this recording.'),
+      h(
+        Text,
+        { dimColor: true, wrap: 'wrap' },
+        'The recorder only began keeping the pairs it rejected recently. Restart it ' +
+          '(npm run stop then npm run start) and the feed appears on the next tick.',
+      ),
+    );
+  }
+
+  const page = Math.max(3, rows);
+  const { start, pages, at } = rotate(scanned.length, page, pageTick);
+  const slice = scanned.slice(start, start + page);
+  const passed = scanned.filter((s) => s.rejectedBy === null).length;
+
+  const cols = fitColumns(
+    [
+      { key: 'sym', w: 12, keep: 9 },
+      { key: 'mcap', w: 9, keep: 7 },
+      { key: 'liq', w: 9, keep: 6 },
+      { key: 'why', w: Math.max(14, width - 30), keep: 8 },
+    ],
+    width,
+  );
+  const wOf = (k) => cols.find((c) => c.key === k)?.w ?? 0;
+
+  return h(
+    Box,
+    { flexDirection: 'column' },
+    h(
+      Box,
+      { gap: 1 },
+      h(Text, { color: live ? 'cyan' : 'red', bold: true }, live ? '·' : '×'),
+      h(Text, { bold: true }, 'SCANNED THIS TICK'),
+      h(
+        Text,
+        { dimColor: true },
+        `${scanned.length} pairs · ${passed} cleared the screen` +
+          (pages > 1 ? ` · page ${at + 1}/${pages}` : ''),
+      ),
+    ),
+    ...slice.map((s) =>
+      h(
+        Box,
+        { key: s.mint },
+        wOf('sym') > 0 &&
+          h(Cell, { w: wOf('sym'), bold: s.rejectedBy === null }, (s.symbol ?? '?').slice(0, 10)),
+        wOf('mcap') > 0 && h(Cell, { w: wOf('mcap'), dimColor: true }, usdShort(s.marketCapUsd)),
+        wOf('liq') > 0 && h(Cell, { w: wOf('liq'), dimColor: true }, usdShort(s.liquidityUsd)),
+        wOf('why') > 0 &&
+          h(
+            Cell,
+            {
+              w: wOf('why'),
+              color: s.rejectedBy === null ? 'green' : undefined,
+              dimColor: s.rejectedBy !== null,
+              bold: s.rejectedBy === null,
+            },
+            s.rejectedBy === null ? 'CLEARED THE SCREEN' : s.rejectedBy,
+          ),
+      ),
+    ),
+  );
+}
+
+/**
+ * Tokens seen in the last few ticks, and whether they are still there.
+ *
+ * Answers a question the interface used to leave hanging: a token would appear
+ * for a tick or two and then be gone, with nothing to say it had ever been
+ * there. Measured over eight consecutive ticks, five different tokens came and
+ * went. LEFT is a real state, so it is shown as one.
+ */
+function Watching({ recent, rows, config, width }) {
+  if (recent.length === 0) return null;
+  const visible = recent.slice(0, Math.max(2, rows));
+  return h(
+    Box,
+    { flexDirection: 'column' },
+    h(
+      Box,
+      { gap: 1 },
+      h(Text, { bold: true }, 'RECENTLY SEEN'),
+      h(
+        Text,
+        { dimColor: true },
+        `last ${config.recentWindowTicks} ticks · they rotate out of the feed, they are not deleted`,
+      ),
+    ),
+    ...visible.map((r) =>
+      h(
+        Box,
+        { key: r.mint },
+        h(Cell, { w: 12, bold: r.inLatest }, (r.symbol ?? '?').slice(0, 10)),
+        h(
+          Cell,
+          { w: 20, color: r.inLatest ? 'green' : 'gray' },
+          r.inLatest ? 'STILL THERE' : `left ${r.ticksSince} tick${r.ticksSince === 1 ? '' : 's'} ago`,
+        ),
+        width > 52 && h(Cell, { w: 11, dimColor: true }, usd(r.liquidityUsd)),
+        width > 64 && h(Cell, { w: 12, dimColor: true }, `seen ${r.seen}×`),
+      ),
+    ),
+  );
+}
+
+/**
+ * Why this token was not entered, in words.
+ *
+ * "no" on its own is not usable information -- the whole question an operator has
+ * about a refusal is which rule refused it. Two different systems can say no here
+ * and they mean opposite things: the safety gate saying no is a warning about the
+ * token, the momentum rules saying no is a statement about the timing. So the
+ * source is named, never merged into one "rejected".
+ *
+ * @returns {{who: string, why: string}|null} null when it WAS entered
+ */
+export function whyNotEntered(c) {
+  if (c.gateBuyable === false) {
+    return {
+      who: 'the safety gate',
+      why: c.gateBlockedBy.length > 0 ? c.gateBlockedBy.join(', ') : 'a layer it did not name',
+    };
+  }
+  if (c.wouldEnter === true) return null;
+  if (c.wouldEnter === null) {
+    // Not a missing value. decideEntry throws when the round trip cannot be
+    // priced, and an unpriceable trade is a refusal -- so this is a real "no"
+    // with a real cause, and reporting it as unknown would hide a rejection.
+    return { who: 'the entry rules', why: 'the round trip could not be priced, so it refused' };
+  }
+  return {
+    who: 'the entry rules',
+    why: c.entryBlockedBy.length > 0 ? c.entryBlockedBy.join(' · ') : 'a rule it did not name',
+  };
+}
+
+/** The whole record for one candidate on the newest tick. */
+function CandidateDetail({ row, width }) {
+  const no = whyNotEntered(row);
+  return h(
+    Box,
+    { flexDirection: 'column', borderStyle: 'round', borderColor: 'cyan', paddingX: 1, width: Math.max(40, width) },
+    h(
+      Box,
+      { gap: 2 },
+      h(Text, { bold: true, color: 'cyan' }, row.symbol ?? '?'),
+      h(Text, { color: row.gateBuyable ? 'green' : 'red', bold: true }, row.gateBuyable ? 'SAFE' : 'BLOCKED'),
+      h(
+        Text,
+        { color: row.wouldEnter === true ? 'green' : 'gray', bold: true },
+        row.wouldEnter === true ? 'WOULD ENTER' : 'NOT ENTERED',
+      ),
+    ),
+    // Full mint, never truncated: the one field here whose purpose is to be
+    // copied elsewhere, and a shortened address looks usable but is not.
+    h(Text, { wrap: 'wrap' }, row.mint),
+    h(Text, null, ''),
+    no === null
+      ? h(Text, { color: 'green' }, 'Nothing refused it. Every layer passed and the momentum rules agreed.')
+      : h(
+          Box,
+          { flexDirection: 'column' },
+          h(Text, { bold: true }, `Refused by ${no.who}:`),
+          h(Text, { color: 'yellow', wrap: 'wrap' }, no.why),
+        ),
+    h(Text, null, ''),
+    h(Field, { label: 'market cap' }, usd(row.marketCapUsd)),
+    h(Field, { label: 'liquidity' }, usd(row.liquidityUsd)),
+    h(Field, { label: 'price 5m / 1h' }, `${pct(row.priceChangeM5Pct)}  /  ${pct(row.priceChangeH1Pct)}`),
+    h(
+      Field,
+      { label: 'buys vs sells' },
+      `${num(row.buySellRatioM5, 2)}   volume acceleration ${num(row.volumeAccelerationRatio, 2)}`,
+    ),
+    h(Field, { label: 'pair age' }, row.ageMinutes === null ? '—' : `${Math.round(row.ageMinutes)} minutes`),
+    h(Text, null, ''),
+    h(Links, { mint: row.mint }),
+  );
+}
+
+function LiveView({ data, rows, width, pageTick, selected, showDetail, canType }) {
   if (data.ticks.length === 0) {
     return h(
       Box,
@@ -181,71 +531,185 @@ function LiveView({ data, width }) {
     );
   }
 
+  const detail = showDetail && data.lastScan.length > 0
+    ? data.lastScan[Math.min(selected, data.lastScan.length - 1)]
+    : null;
+
+  // Split the vertical space between the three lists rather than hard-coding
+  // heights: a short terminal must lose rows, not push the footer off screen.
+  // Each candidate costs TWO rows now, because the refusal reason gets its own
+  // line -- a 7-column "no" cannot hold a sentence, and the reason is the part
+  // worth reading.
+  const candRows = Math.min(data.lastScan.length, 4);
+  const watchRows = detail !== null ? 0 : Math.min(data.recent.length, 3);
+  // Vertical budget, counted rather than guessed. Overflowing by even one line
+  // scrolls the terminal, which pushes the header -- the part that says whether
+  // the recorder is alive -- off the top. Measured at 41 lines in a 40-row
+  // terminal before this: the guess did not allow for the status line wrapping
+  // to two rows on a narrow screen.
+  //
+  //   chrome outside the panel   header 2 + nav 2 + borders 2 + footer 2 = 8
+  //   fixed rows inside it       strip 2 + 3 blanks + 3 headings + 1 hint = 9
+  //   one row of slack
+  // The panel's own height depends on the WIDTH: the address and the two links
+  // wrap when the terminal is narrow, and each wrap costs a row. Measured 41
+  // lines in a 40-row terminal at 60 columns with a flat reserve of 20.
+  const detailRows = detail === null ? 0 : width < 90 ? 25 : 20;
+  const feedRows = Math.max(2, rows - 18 - candRows * 2 - watchRows - detailRows);
+
+  const cols = fitColumns(
+    [
+      { key: 'sym', w: 11, keep: 9, head: 'TOKEN', cell: (c) => [(c.symbol ?? '?').slice(0, 9), { bold: true }] },
+      { key: 'safe', w: 9, keep: 8, head: 'SAFE?', cell: (c) => [c.gateBuyable ? 'SAFE' : 'blocked', { color: c.gateBuyable ? 'green' : 'red' }] },
+      { key: 'enter', w: 7, keep: 8, head: 'ENTER?', cell: (c) => (c.gateBuyable ? [c.wouldEnter ? 'ENTER' : 'no', { color: c.wouldEnter ? 'green' : 'gray', bold: Boolean(c.wouldEnter) }] : ['—', { dimColor: true }]) },
+      { key: 'mcap', w: 10, keep: 7, head: 'MCAP', cell: (c) => [usd(c.marketCapUsd), {}] },
+      { key: 'liq', w: 10, keep: 6, head: 'LIQ', cell: (c) => [usd(c.liquidityUsd), {}] },
+      { key: 'm5', w: 8, keep: 5, head: '5m', cell: (c) => [pct(c.priceChangeM5Pct), { color: (c.priceChangeM5Pct ?? 0) >= 0 ? 'green' : 'red' }] },
+      { key: 'h1', w: 9, keep: 4, head: '1h', cell: (c) => [pct(c.priceChangeH1Pct), { color: (c.priceChangeH1Pct ?? 0) >= 0 ? 'green' : 'red' }] },
+      { key: 'acc', w: 6, keep: 3, head: 'ACC', cell: (c) => [num(c.volumeAccelerationRatio, 1), {}] },
+      { key: 'bs', w: 6, keep: 2, head: 'B/S', cell: (c) => [num(c.buySellRatioM5, 1), {}] },
+      { key: 'age', w: 6, keep: 1, head: 'AGE', cell: (c) => [c.ageMinutes === null ? '—' : Math.round(c.ageMinutes) + 'm', {}] },
+    ],
+    // Two columns reserved for the selection marker.
+    width - 2,
+  );
+
   return h(
     Box,
     { flexDirection: 'column' },
     h(ActivityStrip, { ticks: data.ticks, width: width - 5 }),
     h(Text, null, ''),
+    h(ScanFeed, {
+      scanned: data.scanned,
+      pageTick,
+      rows: feedRows,
+      live: data.recorder.healthy,
+      width,
+    }),
+    h(Text, null, ''),
     data.lastScan.length === 0
       ? h(
           Text,
           { dimColor: true, wrap: 'wrap' },
-          'The last scan saw nothing that cleared the universe screen. 98.6% of these ' +
-            'tokens are rugs or under $1k liquidity, so an empty scan is the filter ' +
-            'working — the strip above is the proof it is running.',
+          'Nothing cleared the screen on the newest tick. The feed above is what it ' +
+            'looked at and why each one was thrown out.',
         )
       : h(
           Box,
           { flexDirection: 'column' },
-          (() => {
-            const cols = fitColumns(
-              [
-                { key: 'sym', w: 11, keep: 9, head: 'TOKEN', cell: (c) => [(c.symbol ?? '?').slice(0, 9), { bold: true }] },
-                { key: 'safe', w: 9, keep: 8, head: 'SAFE?', cell: (c) => [c.gateBuyable ? 'SAFE' : 'blocked', { color: c.gateBuyable ? 'green' : 'red' }] },
-                { key: 'enter', w: 7, keep: 8, head: 'ENTER?', cell: (c) => (c.gateBuyable ? [c.wouldEnter ? 'ENTER' : 'no', { color: c.wouldEnter ? 'green' : 'gray', bold: Boolean(c.wouldEnter) }] : ['—', { dimColor: true }]) },
-                { key: 'mcap', w: 10, keep: 7, head: 'MCAP', cell: (c) => [usd(c.marketCapUsd), {}] },
-                { key: 'liq', w: 10, keep: 6, head: 'LIQ', cell: (c) => [usd(c.liquidityUsd), {}] },
-                { key: 'm5', w: 8, keep: 5, head: '5m', cell: (c) => [pct(c.priceChangeM5Pct), { color: (c.priceChangeM5Pct ?? 0) >= 0 ? 'green' : 'red' }] },
-                { key: 'h1', w: 9, keep: 4, head: '1h', cell: (c) => [pct(c.priceChangeH1Pct), { color: (c.priceChangeH1Pct ?? 0) >= 0 ? 'green' : 'red' }] },
-                { key: 'acc', w: 6, keep: 3, head: 'ACC', cell: (c) => [num(c.volumeAccelerationRatio, 1), {}] },
-                { key: 'bs', w: 6, keep: 2, head: 'B/S', cell: (c) => [num(c.buySellRatioM5, 1), {}] },
-                { key: 'age', w: 6, keep: 1, head: 'AGE', cell: (c) => [c.ageMinutes === null ? '—' : Math.round(c.ageMinutes) + 'm', {}] },
-              ],
-              width,
-            );
-            return h(
-              Box,
-              { flexDirection: 'column' },
-              h(Box, null, ...cols.map((col) => h(Head, { key: col.key, w: col.w }, col.head))),
-              ...data.lastScan.map((c) =>
+          h(
+            Box,
+            null,
+            h(Cell, { w: 2 }, ' '),
+            ...cols.map((col) => h(Head, { key: col.key, w: col.w }, col.head)),
+          ),
+          ...data.lastScan.slice(0, candRows).flatMap((c, i) => {
+            const isSel = i === selected;
+            const no = whyNotEntered(c);
+            return [
+              h(
+                Box,
+                { key: c.mint },
+                h(Cell, { w: 2, color: 'cyan', bold: true }, isSel ? '▶' : ' '),
+                ...cols.map((col) => {
+                  const [text, props] = col.cell(c);
+                  return h(Cell, { key: col.key, w: col.w, ...props, inverse: isSel }, String(text));
+                }),
+              ),
+              // The reason on its own line. A refusal with no stated cause is
+              // the thing this screen most needs not to do: it turns a decision
+              // into a mood.
+              no !== null &&
                 h(
                   Box,
-                  { key: c.mint },
-                  ...cols.map((col) => {
-                    const [text, props] = col.cell(c);
-                    return h(Cell, { key: col.key, w: col.w, ...props }, String(text));
-                  }),
+                  { key: `${c.mint}-why` },
+                  h(Cell, { w: 5 }, ' '),
+                  h(
+                    Text,
+                    { wrap: 'truncate', color: c.gateBuyable === false ? 'red' : 'yellow', dimColor: true },
+                    `↳ ${no.who}: ${no.why}`,
+                  ),
                 ),
-              ),
-            );
-          })(),
-          h(Text, null, ''),
+            ].filter(Boolean);
+          }),
           h(
             Text,
-            { dimColor: true, wrap: 'wrap' },
-            'SAFE? is the gate — the creator probably cannot steal your tokens. ENTER? is ' +
-              'the momentum rules. Different questions: most tokens are one without the other, ' +
-              'and a soft rug passes every safety check.',
+            { dimColor: true },
+            canType
+              ? '↑/↓ move · enter or space for the address and the full reason'
+              : 'SAFE? is the gate. ENTER? is the momentum rules. Different questions.',
           ),
         ),
+    detail !== null && h(Text, null, ''),
+    detail !== null && h(CandidateDetail, { row: detail, width: width - 2 }),
+    watchRows > 0 && h(Text, null, ''),
+    // Only when the budget actually allowed for it. Watching clamps its own row
+    // count to a minimum of 2, so passing 0 rendered two rows the budget had not
+    // reserved -- which is how a vertical budget silently goes wrong.
+    watchRows > 0 &&
+      h(Watching, { recent: data.recent, rows: watchRows, config: data.config, width }),
   );
 }
 
-function HistoryView({ data, rows, width }) {
+/** The whole record for one token, for when the table's columns are not enough. */
+function TokenDetail({ row, config, width }) {
+  const blocked = row.gateBlockedBy.length > 0 ? row.gateBlockedBy.join(', ') : 'nothing';
+  return h(
+    Box,
+    { flexDirection: 'column', borderStyle: 'round', borderColor: 'cyan', paddingX: 1, width: Math.max(40, width) },
+    h(
+      Box,
+      { gap: 2 },
+      h(Text, { bold: true, color: 'cyan' }, row.symbol ?? '?'),
+      h(Text, { color: tone(row.changePct), bold: true }, pct(row.changePct)),
+      h(Text, { dimColor: true }, `${row.seen} sighting${row.seen === 1 ? '' : 's'}`),
+    ),
+    // Full mint on its own line, never truncated: it is the one field on this
+    // screen whose whole purpose is to be copied somewhere else, and a truncated
+    // address is worse than no address because it looks usable.
+    h(Text, { wrap: 'wrap' }, row.mint),
+    h(Text, null, ''),
+    h(Field, { label: 'first seen' }, `${clock(row.firstTs)}   (${row.ageHours.toFixed(1)}h ago)`),
+    h(Field, { label: 'last seen' }, clock(row.lastSeenTs)),
+    h(Field, { label: 'at entry' }, `${usd(row.entryLiquidityUsd)} liquidity · ${usd(row.entryMarketCapUsd)} mcap · ${usd(row.entryPriceUsd)}`),
+    h(
+      Field,
+      { label: 'latest' },
+      `${usd(row.nowLiquidityUsd)} liquidity` +
+        (row.measured ? '   (re-measured by the labeller)' : '   (last recorded, NOT re-measured)'),
+    ),
+    h(
+      Field,
+      { label: 'gate', color: row.gateBuyable ? 'green' : 'red' },
+      row.gateBuyable ? 'passed every layer' : `blocked by ${blocked}`,
+    ),
+    h(
+      Field,
+      {
+        label: 'outcome',
+        color: row.label === config.RUGGED ? 'red' : row.label === config.SURVIVED ? 'green' : 'gray',
+      },
+      row.label ?? 'unlabelled — counted as UNKNOWN, never as survived',
+    ),
+    h(Text, null, ''),
+    h(Links, { mint: row.mint }),
+  );
+}
+
+function HistoryView({ data, rows, width, selected, showDetail, canType }) {
   if (data.history.length === 0) {
     return h(Text, { dimColor: true }, 'Nothing recorded yet.');
   }
-  const visible = data.history.slice(0, Math.max(3, rows - 9));
+
+  const detail = showDetail ? data.history[Math.min(selected, data.history.length - 1)] : null;
+  const bodyRows = Math.max(3, rows - (detail ? 22 : 9));
+
+  // Scroll the window to keep the selection inside it, and stop at both ends so
+  // the last page is full rather than trailing off into blank rows.
+  const half = Math.floor(bodyRows / 2);
+  const start = Math.min(Math.max(0, selected - half), Math.max(0, data.history.length - bodyRows));
+  const visible = data.history.slice(start, start + bodyRows);
+
   const cols = fitColumns(
     [
       { key: 'sym', w: 11, keep: 9, head: 'TOKEN', cell: (r) => [(r.symbol ?? '?').slice(0, 9), { bold: true }] },
@@ -258,30 +722,236 @@ function HistoryView({ data, rows, width }) {
       { key: 'seen', w: 6, keep: 2, head: 'SEEN', cell: (r) => [String(r.seen), {}] },
       { key: 'age', w: 5, keep: 1, head: 'AGE', cell: (r) => [r.ageHours.toFixed(0) + 'h', {}] },
     ],
-    width,
+    // Two columns are reserved for the selection marker.
+    width - 2,
   );
+
   return h(
     Box,
     { flexDirection: 'column' },
-    h(Box, null, ...cols.map((col) => h(Head, { key: col.key, w: col.w }, col.head))),
-    ...visible.map((r) =>
-      h(
+    h(
+      Box,
+      null,
+      h(Cell, { w: 2 }, ' '),
+      ...cols.map((col) => h(Head, { key: col.key, w: col.w }, col.head)),
+    ),
+    ...visible.map((r, i) => {
+      const isSel = start + i === selected;
+      return h(
         Box,
         { key: r.mint },
+        h(Cell, { w: 2, color: 'cyan', bold: true }, isSel ? '▶' : ' '),
         ...cols.map((col) => {
           const [text, props] = col.cell(r);
-          return h(Cell, { key: col.key, w: col.w, ...props }, String(text));
+          // The selected row is inverted rather than recoloured: the colours
+          // already carry meaning here, and overriding them to show focus would
+          // destroy the information they encode.
+          return h(Cell, { key: col.key, w: col.w, ...props, inverse: isSel }, String(text));
         }),
+      );
+    }),
+    h(
+      Text,
+      { dimColor: true },
+      `${selected + 1} of ${data.history.length}, worst first` +
+        (canType ? ' · ↑/↓ move · enter or space for the address and full record' : ' · no keys in this terminal'),
+    ),
+    detail !== null && h(Text, null, ''),
+    detail !== null && h(TokenDetail, { row: detail, config: data.config, width: width - 2 }),
+  );
+}
+
+/**
+ * The paper book: the same numbers Telegram sends.
+ *
+ * Reads the bot's published journal and shows it verbatim. It derives NOTHING --
+ * not a P&L, not an equity figure, not a position size. That is the whole point.
+ * This screen showed no positions at all while Telegram reported open trades and
+ * a running loss, because the bot held its book only in memory and each surface
+ * answered from its own state. A reader that recomputes is a second brain, and
+ * two brains eventually disagree about money.
+ */
+function PositionsView({ data, rows, width, selected, showDetail, canType }) {
+  const { hasBook, book, trades } = data.paper;
+
+  if (!hasBook) {
+    return h(
+      Box,
+      { flexDirection: 'column' },
+      h(Text, { color: 'yellow', bold: true }, 'The bot has not published a book yet.'),
+      h(Text, null, ''),
+      h(
+        Text,
+        { dimColor: true, wrap: 'wrap' },
+        'Nothing here comes from the recording — this screen shows only what the bot ' +
+          'writes to its journal. Two reasons it can be empty: the bot is running without ' +
+          '--paper, so there is no book; or it has taken no trade yet, because it publishes ' +
+          'only when the book changes.',
+      ),
+      h(Text, null, ''),
+      h(
+        Text,
+        { color: 'yellow', wrap: 'wrap' },
+        'If Telegram IS reporting positions and this is empty, the running bot predates the ' +
+          'journal and has to be restarted: npm run stop, then npm run start.',
+      ),
+    );
+  }
+
+  const pnl = book.realisedPnlUsd + book.unrealisedPnlUsd;
+  const detail =
+    showDetail && trades.length > 0 ? trades[Math.min(selected, trades.length - 1)] : null;
+  const openRows = book.positions.length;
+  const tradeRows = Math.max(2, rows - 17 - openRows - (detail === null ? 0 : 14));
+  const start = Math.min(
+    Math.max(0, selected - Math.floor(tradeRows / 2)),
+    Math.max(0, trades.length - tradeRows),
+  );
+  const visible = trades.slice(start, start + tradeRows);
+
+  return h(
+    Box,
+    { flexDirection: 'column' },
+    h(
+      Box,
+      { gap: 2 },
+      h(Text, { bold: true }, `EQUITY ${money(book.equityUsd)}`),
+      h(
+        Text,
+        { color: pnl > 0 ? 'green' : pnl < 0 ? 'red' : 'gray', bold: true },
+        `${money(pnl, true)} all in`,
+      ),
+      h(Text, { dimColor: true }, `on a ${money(book.bookSizeUsd)} book`),
+    ),
+    h(
+      Box,
+      { gap: 2 },
+      h(Text, { dimColor: true }, `realised ${money(book.realisedPnlUsd, true)}`),
+      h(Text, { dimColor: true }, `unrealised ${money(book.unrealisedPnlUsd, true)}`),
+      h(Text, { dimColor: true }, `cash ${money(book.cashUsd)}`),
+      width > 74 && h(Text, { dimColor: true }, `costs ${money(book.costsPaidUsd)}`),
+    ),
+    h(
+      Text,
+      { dimColor: true },
+      `${book.wins}W / ${book.losses}L · ${book.openedCount} opened · ${book.closedCount} closed` +
+        (book.consecutiveLosses > 0
+          ? ` · ${book.consecutiveLosses} loss${book.consecutiveLosses === 1 ? '' : 'es'} in a row`
+          : ''),
+    ),
+    h(Text, null, ''),
+    h(Text, { bold: true }, openRows === 0 ? 'NO OPEN POSITIONS' : 'OPEN POSITIONS'),
+    ...book.positions.map((p) =>
+      h(
+        Box,
+        { key: p.mint },
+        h(Cell, { w: 12, bold: true }, (p.symbol ?? p.mint.slice(0, 8)).slice(0, 10)),
+        h(Cell, { w: 9, dimColor: true }, money(p.sizeUsd)),
+        width > 48 && h(Cell, { w: 13, dimColor: true }, `in ${usd(p.entryPriceUsd)}`),
+        width > 62 && h(Cell, { w: 13, dimColor: true }, `now ${usd(p.lastPriceUsd)}`),
+        h(
+          Cell,
+          { w: 11, color: (p.unrealisedPnlUsd ?? 0) >= 0 ? 'green' : 'red', bold: true },
+          money(p.unrealisedPnlUsd, true),
+        ),
       ),
     ),
+    h(Text, null, ''),
+    trades.length === 0
+      ? h(Text, { dimColor: true }, 'No closed trades yet.')
+      : h(
+          Box,
+          { flexDirection: 'column' },
+          h(
+            Box,
+            null,
+            h(Cell, { w: 2 }, ' '),
+            h(Head, { w: 12 }, 'CLOSED'),
+            h(Head, { w: 11 }, 'P&L'),
+            width > 54 && h(Head, { w: 22 }, 'WHY IT CLOSED'),
+            width > 78 && h(Head, { w: 10 }, 'AT'),
+          ),
+          ...visible.map((t, i) => {
+            const isSel = start + i === selected;
+            return h(
+              Box,
+              { key: `${t.mint}:${t.closedTs ?? t.ts}:${start + i}` },
+              h(Cell, { w: 2, color: 'cyan', bold: true }, isSel ? '\u25b6' : ' '),
+              h(
+                Cell,
+                { w: 12, bold: true, inverse: isSel },
+                (t.symbol ?? t.mint.slice(0, 8)).slice(0, 10),
+              ),
+              h(
+                Cell,
+                {
+                  w: 11,
+                  color: (t.netPnlUsd ?? 0) >= 0 ? 'green' : 'red',
+                  bold: true,
+                  inverse: isSel,
+                },
+                money(t.netPnlUsd, true),
+              ),
+              width > 54 && h(Cell, { w: 22, dimColor: true, inverse: isSel }, t.reason ?? '—'),
+              width > 78 &&
+                h(Cell, { w: 10, dimColor: true, inverse: isSel }, clock(t.closedTs ?? t.ts)),
+            );
+          }),
+          h(
+            Text,
+            { dimColor: true },
+            `${selected + 1} of ${trades.length} closed` +
+              (canType ? ' · up/down move · enter or space for the address' : ''),
+          ),
+        ),
+    detail !== null && h(Text, null, ''),
+    detail !== null &&
+      h(
+        Box,
+        {
+          flexDirection: 'column',
+          borderStyle: 'round',
+          borderColor: 'cyan',
+          paddingX: 1,
+          width: Math.max(40, width - 2),
+        },
+        h(
+          Box,
+          { gap: 2 },
+          h(Text, { bold: true, color: 'cyan' }, detail.symbol ?? '?'),
+          h(
+            Text,
+            { color: (detail.netPnlUsd ?? 0) >= 0 ? 'green' : 'red', bold: true },
+            `${money(detail.netPnlUsd, true)}  ${pct(detail.netPnlPct)}`,
+          ),
+          h(Text, { dimColor: true }, detail.reason ?? ''),
+        ),
+        h(Text, { wrap: 'wrap' }, detail.mint),
+        h(Text, null, ''),
+        h(Field, { label: 'size' }, money(detail.sizeUsd)),
+        h(Field, { label: 'in then out' }, `${usd(detail.entryPriceUsd)}  to  ${usd(detail.exitPriceUsd)}`),
+        // Gross beside net, so the cost of trading is visible rather than folded
+        // into one number. On a $40 position the two legs are most of the answer.
+        h(
+          Field,
+          { label: 'gross then net' },
+          `${money(detail.grossPnlUsd, true)}  minus ${money(detail.totalCostUsd)} costs  =  ` +
+            `${money(detail.netPnlUsd, true)}`,
+        ),
+        h(
+          Field,
+          { label: 'held' },
+          `${clock(detail.openedTs)} to ${clock(detail.closedTs)}` +
+            (Number.isFinite(detail.holdMs) ? `   (${Math.round(detail.holdMs / 60000)} min)` : ''),
+        ),
+        h(Text, null, ''),
+        h(Links, { mint: detail.mint }),
+      ),
     h(Text, null, ''),
     h(
       Text,
       { dimColor: true, wrap: 'wrap' },
-      `${data.history.length} tokens recorded${visible.length < data.history.length ? `, showing ${visible.length}` : ''}. ` +
-        'AT ENTRY is the first sighting. A ~ on LATEST means it is the last recorded value, ' +
-        'not re-measured — that runs high, because the recorder stops watching a token the ' +
-        'moment it drops out of the screen. Each TRACE block is one real sighting.',
+      'Published by the bot, not recomputed here — the same figures Telegram sends.',
     ),
   );
 }
@@ -372,9 +1042,26 @@ function EvidenceView({ data }) {
   );
 }
 
+/**
+ * The memo boundary, and the reason it is load-bearing.
+ *
+ * These are not a performance nicety. A subtree React re-renders is a subtree Ink
+ * rebuilds, and Ink 7.1.1 leaks about 1.6KB per Box every time it does -- so an
+ * unmemoized table under a one-second clock is a measured 8 GB/hour. Wrapping
+ * them cut the same benchmark to 45 MB/hour.
+ *
+ * The props are therefore chosen to change only when the OUTPUT changes: a page
+ * tick rather than a frame counter, and a `data` object the read loop replaces
+ * only when the underlying recording actually moved.
+ */
+const LiveViewMemo = memo(LiveView);
+const PositionsViewMemo = memo(PositionsView);
+const HistoryViewMemo = memo(HistoryView);
+const EvidenceViewMemo = memo(EvidenceView);
+
 /* ---------------------------------------------------------------------- app */
 
-function App({ dir, refreshMs, initialView }) {
+export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail = false }) {
   const { exit } = useApp();
   // Ink THROWS from useInput when the terminal has no raw mode -- which is the
   // likely cause of 'the keys do nothing': not a bug in the handler, but a
@@ -391,20 +1078,54 @@ function App({ dir, refreshMs, initialView }) {
   const [error, setError] = useState(null);
   const [reads, setReads] = useState(0);
   const [nudge, setNudge] = useState(0);
+  const [frame, setFrame] = useState(0);
+  // One cursor PER view. A single shared index would jump the moment you switched
+  // -- row 40 of a 90-token history is meaningless in a 3-row candidate list.
+  const [cursor, setCursor] = useState(Object.freeze({ live: 0, positions: 0, history: 0 }));
+  const [showDetail, setShowDetail] = useState(openDetail);
+  // What the last accepted payload looked like. A ref, not state: changing it
+  // must not itself cause a render.
+  const sigRef = useRef('');
 
-  const termCols = process.stdout.columns || 100;
-  // The bordered box costs 2 columns, paddingX:1 costs 2 more. Budget against
-  // what is actually left, not against the terminal width.
-  const inner = Math.max(28, termCols - 6);
+  // `cols` is an explicit override. Needed because a piped stdout reports no
+  // width at all, so --once always rendered at the fallback -- which made a
+  // width sweep silently measure one width four times and report it as a pass.
+  const termCols = cols ?? process.stdout.columns ?? 100;
+  // The border costs 2 columns and paddingX:1 costs 2 more, so content gets
+  // termCols - 4. Every box in the tree is termCols wide: the bordered panel used
+  // to be termCols inside a PARENT NARROWER THAN ITSELF, and a child wider than
+  // its parent put the right-hand border in a different column depending on the
+  // row -- visible as a ragged edge running down the side of the panel.
+  const inner = Math.max(24, termCols - 4);
   const rows = process.stdout.rows || 30;
 
   useEffect(() => {
     let live = true;
     const read = async () => {
       try {
-        const next = await buildDashData({ dir, now: Date.now() });
+        const next = await buildDashData({ dir, journalDir, now: Date.now() });
         if (!live) return;
-        setData(next);
+        // Only replace the payload when the underlying data MOVED.
+        //
+        // Every payload is a fresh frozen object, so handing it to setState
+        // unconditionally re-rendered every table three times a second even
+        // though the recorder only writes once a minute -- and each of those
+        // wasted re-renders leaks (see the note at the top of this file). The
+        // signature is cheap and covers everything the screens display.
+        const sig = [
+          next.ticks.length,
+          next.ticks.at(-1)?.ts ?? 0,
+          next.history.length,
+          next.scanned.length,
+          next.lastScan.length,
+          next.paper.trades.length,
+          next.paper.book?.ts ?? 0,
+          next.evidence.tally.snapshots,
+        ].join(':');
+        if (sig !== sigRef.current) {
+          sigRef.current = sig;
+          setData(next);
+        }
         setError(null);
         setReads((n) => n + 1);
       } catch (err) {
@@ -417,29 +1138,90 @@ function App({ dir, refreshMs, initialView }) {
       live = false;
       clearInterval(timer);
     };
-  }, [dir, refreshMs, nudge]);
+  }, [dir, journalDir, refreshMs, nudge]);
+
+  // The animation clock, separate from the read clock. It advances the scan feed
+  // and re-derives the snapshot age, so the countdown moves every second instead
+  // of jumping in whole refresh intervals.
+  useEffect(() => {
+    const timer = setInterval(() => setFrame((f) => f + 1), FRAME_MS);
+    return () => clearInterval(timer);
+  }, []);
 
   // Input is handled independently of the read timer, so a keypress is never
   // waiting on anything.
-  useInput((input, key) => {
-    if (input === 'q' || key.escape || (key.ctrl && input === 'c')) exit();
-    else if (input === '1') setView(VIEWS[0]);
-    else if (input === '2') setView(VIEWS[1]);
-    else if (input === '3') setView(VIEWS[2]);
-    else if (input === 'r') setNudge((n) => n + 1);
-    else if (key.rightArrow || key.tab)
-      setView((v) => VIEWS[(VIEWS.indexOf(v) + 1) % VIEWS.length]);
-    else if (key.leftArrow)
-      setView((v) => VIEWS[(VIEWS.indexOf(v) + VIEWS.length - 1) % VIEWS.length]);
-  }, { isActive: canType });
+  // The list the cursor is currently walking. Both views are selectable; the
+  // evidence view has no rows, so the arrows fall through to nothing there.
+  const listLength =
+    view === 'history'
+      ? data.history.length
+      : view === 'positions'
+        ? data.paper.trades.length
+        : data.lastScan.length;
+  const selected = Math.min(cursor[view] ?? 0, Math.max(0, listLength - 1));
 
-  const age =
-    data.recorder.snapshotAgeMs === null
-      ? null
-      : Math.round(data.recorder.snapshotAgeMs / MS_PER_SECOND);
+  useInput(
+    (input, key) => {
+      const last = Math.max(0, listLength - 1);
+      // Clamp on every move against the CURRENT length. The lists are rebuilt
+      // from disk every few seconds and they shrink -- a cursor held past the end
+      // would index undefined and take the whole screen down with it.
+      const move = (delta) =>
+        setCursor((c) => ({ ...c, [view]: Math.max(0, Math.min(last, (c[view] ?? 0) + delta)) }));
+
+      if (input === 'q' || (key.ctrl && input === 'c')) exit();
+      else if (key.escape) {
+        // Escape backs out of the panel first. Quitting the whole dashboard
+        // because someone wanted to close a detail view would be hostile.
+        if (showDetail) setShowDetail(false);
+        else exit();
+      } else if (input === '1') setView(VIEWS[0]);
+      else if (input === '2') setView(VIEWS[1]);
+      else if (input === '3') setView(VIEWS[2]);
+      else if (input === '4') setView(VIEWS[3]);
+      else if (input === 'r') setNudge((n) => n + 1);
+      else if (key.upArrow) move(-1);
+      else if (key.downArrow) move(1);
+      else if (key.pageUp) move(-10);
+      else if (key.pageDown) move(10);
+      else if (key.return || input === ' ') {
+        // Only meaningful where there is a row under the cursor. On the evidence
+        // view it goes to the history list rather than appearing to do nothing.
+        if (view === 'evidence') {
+          setView('history');
+          setShowDetail(true);
+        } else setShowDetail((s) => !s);
+      } else if (key.rightArrow || key.tab)
+        setView((v) => VIEWS[(VIEWS.indexOf(v) + 1) % VIEWS.length]);
+      else if (key.leftArrow) setView((v) => VIEWS[(VIEWS.indexOf(v) + VIEWS.length - 1) % VIEWS.length]);
+    },
+    { isActive: canType },
+  );
+
+  // Derive the age from the snapshot's own timestamp on every frame, rather than
+  // reusing the figure computed at read time. Otherwise "3s ago" sits frozen for
+  // a whole refresh interval and a stalling recorder looks fine for longer than
+  // it should.
+  const snapTs =
+    data.recorder.snapshotAgeMs === null ? null : data.generatedAt - data.recorder.snapshotAgeMs;
+  const age = snapTs === null ? null : Math.max(0, Math.round((Date.now() - snapTs) / MS_PER_SECOND));
+  const due = age === null ? null : data.recorder.expectedEverySeconds - age;
+
+  // Derived from the frame counter, so the animated parts re-render while the
+  // tables do not. The spinner stops when the recorder does: one that keeps
+  // turning over dead data is worse than no spinner at all.
+  const spin = data.recorder.healthy ? SPINNER[frame % SPINNER.length] : '×';
+  // Sampled on the header's own clock, which re-renders anyway, so this costs
+  // nothing extra. process.memoryUsage() is a syscall-free read of V8 counters.
+  const heapMb = Math.round(process.memoryUsage().heapUsed / 1_048_576);
+  const pageTick = Math.floor((frame * FRAME_MS) / (SCAN_PAGE_SECONDS * MS_PER_SECOND));
 
   const status = data.recorder.healthy
-    ? h(Text, { color: 'green' }, `recording · last snapshot ${age}s ago`)
+    ? h(
+        Text,
+        { color: 'green' },
+        `recording · ${age}s ago` + (due !== null && due > 0 ? ` · next in ${due}s` : ' · next due now'),
+      )
     : age === null
       ? h(Text, { color: 'red', bold: true }, 'NO RECORDING — run: npm run start')
       : h(
@@ -451,17 +1233,66 @@ function App({ dir, refreshMs, initialView }) {
 
   return h(
     Box,
-    { flexDirection: 'column', width: inner },
+    { flexDirection: 'column', width: termCols },
+    // The ONLY part that re-renders on the clock. Six nodes, so the per-render
+    // cost of Ink's leak is six times 1.6KB rather than the whole screen's.
     h(
       Box,
-      { gap: 2 },
+      { gap: 2, height: CHROME.header, overflow: 'hidden' },
       h(Text, { bold: true }, 'SOLSCALP'),
+      h(Text, { color: data.recorder.healthy ? 'cyan' : 'red', bold: true }, spin),
       status,
-      h(Text, { dimColor: true }, `profile ${data.recorder.profile ?? '?'}`),
+      heapMb >= HEAP_WARN_MB
+        ? h(
+            Text,
+            { color: heapMb >= HEAP_URGENT_MB ? 'red' : 'yellow', bold: true },
+            `memory ${(heapMb / 1024).toFixed(1)}GB — ` +
+              (heapMb >= HEAP_URGENT_MB ? 'RESTART NOW (q, then npm run dash)' : 'restart me soon'),
+          )
+        : h(Text, { dimColor: true }, `profile ${data.recorder.profile ?? '?'} · reads ${reads}`),
     ),
+    h(Body, {
+      data,
+      view,
+      error,
+      selected,
+      showDetail,
+      canType,
+      pageTick,
+      inner,
+      termCols,
+      rows,
+    }),
+  );
+}
+
+/**
+ * Everything below the header, memoized as one unit.
+ *
+ * Its props deliberately exclude anything that changes on the animation clock or
+ * on a read that found nothing new -- no frame counter, no `reads` tally, no
+ * timestamp. That is what keeps this subtree still: measured 150 MB/hour of leak
+ * when the whole tree rebuilt every second, against roughly 40 when only the
+ * header does.
+ */
+const Body = memo(function Body({
+  data,
+  view,
+  error,
+  selected,
+  showDetail,
+  canType,
+  pageTick,
+  inner,
+  termCols,
+  rows,
+}) {
+  return h(
+    Box,
+    { flexDirection: 'column', width: termCols },
     h(
       Box,
-      { gap: 2, marginTop: 1 },
+      { gap: 2, marginTop: 1, height: CHROME.nav, overflow: 'hidden' },
       ...VIEWS.map((v, i) =>
         h(
           Text,
@@ -475,12 +1306,8 @@ function App({ dir, refreshMs, initialView }) {
         ),
       ),
       canType
-        ? h(Text, { dimColor: true }, '· ←/→ switch · r reload · q quit')
-        : h(
-            Text,
-            { color: 'yellow' },
-            '· no keys here: use --view',
-          ),
+        ? h(Text, { dimColor: true }, '· arrows move · enter details · r reload · q quit')
+        : h(Text, { color: 'yellow' }, '· no keys here: use --view'),
     ),
     h(
       Box,
@@ -491,28 +1318,36 @@ function App({ dir, refreshMs, initialView }) {
         paddingX: 1,
         marginTop: 1,
         width: termCols,
+        // A HARD CEILING, enforced by the layout engine rather than by arithmetic.
+        // Each view budgets its own rows and those budgets kept being wrong at the
+        // edges. A view that asks for too much now loses its bottom rows instead
+        // of pushing the footer, or the header that says whether the recorder is
+        // alive, off the top of the screen.
+        height: Math.max(6, rows - CHROME.total),
+        overflow: 'hidden',
       },
       error !== null
         ? h(Text, { color: 'red', wrap: 'wrap' }, `read failed: ${error}`)
-        : view === 'history'
-          ? h(HistoryView, { data, rows, width: inner })
-          : view === 'evidence'
-            ? h(EvidenceView, { data })
-            : h(LiveView, { data, width: inner }),
+        : view === 'positions'
+          ? h(PositionsViewMemo, { data, rows, width: inner, selected, showDetail, canType })
+          : view === 'history'
+            ? h(HistoryViewMemo, { data, rows, width: inner, selected, showDetail, canType })
+            : view === 'evidence'
+              ? h(EvidenceViewMemo, { data })
+              : h(LiveViewMemo, { data, rows, width: inner, pageTick, selected, showDetail, canType }),
     ),
     h(
       Box,
-      { gap: 2 },
+      { gap: 2, height: CHROME.footer, overflow: 'hidden' },
       h(
         Text,
         { dimColor: true },
         `book ${usd(data.config.bookSizeUsd)} · position ${usd(data.config.positionSizeUsd)} · ` +
-          `mcap ${usd(data.config.minMarketCapUsd)}–${usd(data.config.maxMarketCapUsd)} · ` +
-          `paper only · reads ${reads}`,
+          `mcap ${usd(data.config.minMarketCapUsd)}–${usd(data.config.maxMarketCapUsd)} · paper only`,
       ),
     ),
   );
-}
+});
 
 /* --------------------------------------------------------------------- main */
 
@@ -530,25 +1365,25 @@ export async function main(argv, deps = {}) {
   }
 
   const dir = typeof flags.dir === 'string' ? flags.dir : RECORDER.dir;
+  const journalDir = typeof flags['paper-dir'] === 'string' ? flags['paper-dir'] : JOURNAL.dir;
   const refreshMs = intFlag(flags.refresh, 3) * MS_PER_SECOND;
   const initialView = VIEWS.includes(flags.view) ? flags.view : VIEWS[0];
+  const cols = flags.cols === undefined ? undefined : intFlag(flags.cols, 100);
+  const openDetail = flags.detail === true;
 
   // --once renders a single frame and exits: the only way this screen is
   // testable, and useful for a quick look without taking over the terminal.
   if (flags.once === true) {
-    const { buildDashData: build } = await import('./lib/dashData.js');
-    const data = await build({ dir, now: Date.now() });
     const app = render(
-      h(Box, { flexDirection: 'column' }, h(App, { dir, refreshMs: 1e9, initialView })),
+      h(Box, { flexDirection: 'column' }, h(App, { dir, journalDir, refreshMs: 1e9, initialView, cols, openDetail })),
       { patchConsole: false },
     );
-    await new Promise((r) => setTimeout(r, 250));
+    await new Promise((r) => setTimeout(r, 400));
     app.unmount();
-    void data;
     return EXIT.OK;
   }
 
-  const app = render(h(App, { dir, refreshMs, initialView }));
+  const app = render(h(App, { dir, journalDir, refreshMs, initialView, cols, openDetail }));
   await app.waitUntilExit();
   return EXIT.OK;
 }

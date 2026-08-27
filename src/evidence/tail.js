@@ -130,6 +130,10 @@ export async function latestSnapshot({ dir = RECORDER.dir, now = Date.now() } = 
         snapshotAgeMs: now - record.ts,
         profile: record.profile ?? null,
         candidates: Object.freeze(candidates),
+        // Every pair the tick LOOKED at, rejects included. Optional: recordings
+        // written before the recorder started keeping them have no such field,
+        // and an older file must degrade to empty rather than crash a reader.
+        scanned: Object.freeze(Array.isArray(record.scanned) ? record.scanned : []),
         pairs: Object.freeze(candidates.map((c) => candidateToPair(c, record.ts))),
         // The recorder already ran the gate. Re-running it would be a second
         // verdict on the same instant, and the two could disagree.
@@ -182,6 +186,7 @@ function empty(fileCount) {
     snapshotAgeMs: null,
     profile: null,
     candidates: Object.freeze([]),
+    scanned: Object.freeze([]),
     pairs: Object.freeze([]),
     gateResults: Object.freeze({}),
     fileCount,

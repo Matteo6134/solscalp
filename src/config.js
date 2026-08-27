@@ -322,6 +322,21 @@ export const BASELINE = Object.freeze({
 });
 
 /** Forward recording. This is the only honest evidence source we can grow. */
+/**
+ * Where the paper bot publishes its book.
+ *
+ * Separate from the recording on purpose. The recording is what the MARKET did
+ * and is never revised; this is what the BOT did. One file holding both would be
+ * two datasets with different meanings and different lifetimes.
+ *
+ * Named JOURNAL rather than PAPER because MODES.PAPER already means something
+ * else -- the trading mode, not a location.
+ */
+export const JOURNAL = Object.freeze({
+  dir: 'data/paper',
+  schemaVersion: 1,
+});
+
 export const RECORDER = Object.freeze({
   dir: 'data/recordings',
   snapshotIntervalSeconds: 60,

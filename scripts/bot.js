@@ -51,7 +51,10 @@ import {
   universeReasons,
 } from '../src/paper/engine.js';
 import { emptyPortfolio, portfolioEquityUsd } from '../src/paper/portfolio.js';
+import { appendJournal, buildBookRecord, buildTradeRecord } from '../src/paper/journal.js';
 import { recheckGate, runGate } from '../src/safety/index.js';
+import { describeError } from '../src/rpc/rpc-errors.js';
+import { JOURNAL } from '../src/config.js';
 import { EXIT, buildRpc, intFlag, isMain, parseArgs, runMain, say } from './lib/cli.js';
 import { costsFor, solPriceFrom } from './lib/liveCosts.js';
 
@@ -175,6 +178,7 @@ export async function main(argv, injected = {}) {
   };
   const universe = flags.early === true ? UNIVERSE_PROFILES.early : undefined;
   const paperEnabled = flags.paper === true;
+  const paperDir = typeof flags['paper-dir'] === 'string' ? flags['paper-dir'] : JOURNAL.dir;
   // Default ON: exactly one process should talk to each upstream. Pass --scan to
   // make the bot fetch for itself, which doubles the API load.
   const fromRecording = flags.scan !== true;
@@ -235,7 +239,7 @@ export async function main(argv, injected = {}) {
 
   while (running) {
     try {
-      await cycle({ state, notifier, deps, universe, paperEnabled, limit, fromRecording });
+      await cycle({ state, notifier, deps, universe, paperEnabled, limit, fromRecording, paperDir });
     } catch (err) {
       out(`cycle failed: ${err?.message ?? err}`);
       if (NOTIFY.events.dataSourceDown) {
@@ -258,7 +262,7 @@ export async function main(argv, injected = {}) {
 
 /* -------------------------------------------------------------------------- */
 
-async function cycle({ state, notifier, deps, universe, paperEnabled, limit, fromRecording }) {
+async function cycle({ state, notifier, deps, universe, paperEnabled, limit, fromRecording, paperDir }) {
   const at = deps.now();
   let screened;
   let gateResults;
@@ -385,6 +389,10 @@ async function cycle({ state, notifier, deps, universe, paperEnabled, limit, fro
       costs,
       universe,
     });
+    // PUBLISH BEFORE NOTIFYING. Telegram used to be the only place a fill
+    // appeared, which made the notifier the de-facto record -- so a Telegram
+    // outage lost the trade. The journal is written first and unconditionally.
+    await publishBook({ state, before, symbolOf, at, dir: paperDir, deps });
     await announceActions({ state, notifier, before, symbolOf, at });
   }
 
@@ -408,6 +416,48 @@ async function cycle({ state, notifier, deps, universe, paperEnabled, limit, fro
     safe: candidates.filter((c) => c.gate.buyable).length,
     wouldEnter: candidates.filter((c) => c.gate.buyable && c.entry.enter).length,
   };
+}
+
+/**
+ * Write the book to disk whenever it changed.
+ *
+ * Guarded, and deliberately non-fatal: a full disk or a locked file must not stop
+ * the bot from trading or alerting. But it is reported rather than swallowed,
+ * because a silently un-journalled book is the exact failure this module exists
+ * to remove.
+ */
+export async function publishBook({ state, before, symbolOf, at, dir, deps = {} }) {
+  const after = state.engine.portfolio;
+  // Cheap change test. Marks move unrealised P&L every cycle, so comparing the
+  // whole object would append on every tick and turn the journal into a log of
+  // price noise; these are the fields a reader actually shows.
+  const changed =
+    before !== after &&
+    (before.openedCount !== after.openedCount ||
+      before.closedCount !== after.closedCount ||
+      before.realisedPnlUsd !== after.realisedPnlUsd ||
+      before.cashUsd !== after.cashUsd ||
+      Math.abs((before.unrealisedPnlUsd ?? 0) - (after.unrealisedPnlUsd ?? 0)) > 0.005);
+  if (!changed) return;
+
+  const symbols = Object.fromEntries(symbolOf);
+  const records = [
+    buildBookRecord({ ts: at, portfolio: after, equityUsd: portfolioEquityUsd(after), symbols }),
+  ];
+  // One durable line per newly closed trade. Counting the delta rather than
+  // reading actions means a close is journalled even if the action list is
+  // trimmed or the notifier path is skipped.
+  const newlyClosed = after.closedCount - before.closedCount;
+  if (newlyClosed > 0) {
+    for (const trade of after.closedTrades.slice(-newlyClosed)) {
+      records.push(buildTradeRecord({ ts: at, trade, symbol: symbolOf.get(trade.mint) ?? null }));
+    }
+  }
+  try {
+    await appendJournal(records, { dir }, deps);
+  } catch (err) {
+    say(`[journal] could not write the book: ${describeError(err)}`);
+  }
 }
 
 /** Turn engine actions into alerts. */

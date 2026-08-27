@@ -40,6 +40,8 @@ import { EXIT, buildRpc, intFlag, isMain, parseArgs, runMain, say } from './lib/
 const GATE_CONCURRENCY = 3;
 const MS_PER_SECOND = 1_000;
 const ISO_DATE_LENGTH = 10;
+/** Ceiling on the scan feed per tick, so a huge trending page cannot bloat a day's file. */
+const MAX_SCANNED_RECORDED = 60;
 
 const USAGE = `usage: npm run record -- [--interval S] [--ticks N] [--early] [--dir PATH]
 
@@ -59,12 +61,30 @@ export const dayFile = (ts) => `${new Date(ts).toISOString().slice(0, ISO_DATE_L
  * Shape one snapshot line. Pure, so its structure is testable without a disk.
  * @returns {object} one JSONL record
  */
-export function buildRecord({ ts, profile, rows, entries = {} }) {
+export function buildRecord({ ts, profile, rows, entries = {}, scanned = [] }) {
   return {
     schemaVersion: RECORDER.schemaVersion,
     ts,
     iso: new Date(ts).toISOString(),
     profile,
+    // EVERY pair this tick looked at, including the ones the screen threw out.
+    //
+    // Previously only survivors were stored, which made the recording unable to
+    // answer "what did it consider?" -- and made the dashboard look frozen
+    // whenever nothing passed, which is most ticks. Keeping the rejects turns an
+    // empty screen into visible work.
+    //
+    // Deliberately tiny: symbol, mint, two numbers and the FIRST reject reason.
+    // A full pair object here would multiply the file size by the rejection
+    // ratio -- roughly 40x -- for data no decision reads. Additive field, so
+    // every existing reader ignores it and schemaVersion does not move.
+    scanned: scanned.slice(0, MAX_SCANNED_RECORDED).map((x) => ({
+      symbol: x.symbol,
+      mint: x.mint,
+      marketCapUsd: x.marketCapUsd,
+      liquidityUsd: x.liquidityUsd,
+      rejectedBy: x.rejectedBy,
+    })),
     candidates: rows.map(({ pair, signals, gate }) => {
     // Layer 1 measured the round trip; keep its price impacts so a consumer can
     // price a trade without re-quoting Jupiter. Without these, decideEntry has no
@@ -128,15 +148,37 @@ async function collect({ universe, rpc, now, fetchPools, fetchPairs, gate, concu
   const mints = [...new Set(pools.map((p) => p.baseMint).filter(Boolean))];
   const pairsByMint = await fetchPairs(mints);
   const at = now();
-  const screened = [...pairsByMint.values()]
-    .filter((p) => p !== null)
-    .filter((pair) => universeReasons(pair, at, universe).length === 0)
-    .map((pair) => ({ pair, signals: readSignals(pair, at) }));
+  const all = [...pairsByMint.values()].filter((p) => p !== null);
+
+  // Judge once, keep both sides. The screen's verdict is needed for the rows to
+  // gate AND for the scan feed, and calling universeReasons twice would risk the
+  // two disagreeing.
+  // readSignals ONCE per pair, and share it. The scan feed and the gated rows
+  // need the same numbers, and reading them off the pair directly does not work:
+  // market cap is derived (pair.marketCapUsd is undefined) and the symbol is
+  // nested at pair.baseToken.symbol. Both silently recorded null until a
+  // candidate showing "Hailey / $101,389" was compared against its own scan row.
+  const judged = all.map((pair) => ({
+    pair,
+    signals: readSignals(pair, at),
+    rejectedBy: universeReasons(pair, at, universe),
+  }));
+  const scanned = judged.map(({ pair, signals, rejectedBy }) => ({
+    symbol: pair.baseToken?.symbol ?? null,
+    mint: pair.mint,
+    marketCapUsd: signals.marketCapUsd,
+    liquidityUsd: signals.liquidityUsd,
+    rejectedBy: rejectedBy.length > 0 ? rejectedBy[0] : null,
+  }));
+  const screened = judged
+    .filter(({ rejectedBy }) => rejectedBy.length === 0)
+    .map(({ pair, signals }) => ({ pair, signals }));
 
   const limit = pLimit(concurrency);
-  return Promise.all(
+  const rows = await Promise.all(
     screened.map((row) => limit(async () => ({ ...row, gate: await gate(row.pair.mint, { rpc }) }))),
   );
+  return { rows, scanned, poolsSeen: all.length };
 }
 
 /**
@@ -195,7 +237,7 @@ export async function main(argv, deps = {}) {
   while (!stopped && ticks < maxTicks) {
     const ts = now();
     try {
-      const rows = await collect({
+      const { rows, scanned } = await collect({
         universe,
         rpc,
         now,
@@ -235,7 +277,7 @@ export async function main(argv, deps = {}) {
           }
         }),
       );
-      const record = buildRecord({ ts, profile, rows, entries });
+      const record = buildRecord({ ts, profile, rows, entries, scanned });
       // One stringify, one newline, one append: a partial write cannot straddle
       // two records, so every earlier line stays independently parseable.
       await write(join(dir, dayFile(ts)), `${JSON.stringify(record)}\n`, 'utf8');

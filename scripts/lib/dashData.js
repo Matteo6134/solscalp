@@ -17,13 +17,16 @@
 
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { LABELS, RECORDER, RISK, STRATEGY } from '../../src/config.js';
+import { JOURNAL, LABELS, RECORDER, RISK, STRATEGY } from '../../src/config.js';
 import { LABEL } from '../../src/evidence/outcome.js';
 import { isRecorderHealthy, latestSnapshot } from '../../src/evidence/tail.js';
+import { loadJournal } from '../../src/paper/journal.js';
 import { BASE_RATE_PCT, MIN_SAMPLE, scoreRugFilter, tallyRecords } from '../backtest-rug-filter.js';
 import { buildWatchlist } from '../watchlist.js';
 
 const MS_PER_HOUR = 3_600_000;
+/** How many recorder ticks a departed token stays visible for. */
+export const RECENT_WINDOW_TICKS = 10;
 
 /**
  * @param {object} [p]
@@ -32,7 +35,7 @@ const MS_PER_HOUR = 3_600_000;
  * @param {object} [deps] `readdir` / `readFile` seams
  * @returns {Promise<Readonly<object>>} frozen payload
  */
-export async function buildDashData({ dir = RECORDER.dir, now = Date.now() } = {}, deps = {}) {
+export async function buildDashData({ dir = RECORDER.dir, journalDir = JOURNAL.dir, now = Date.now() } = {}, deps = {}) {
   const list = deps.readdir ?? readdir;
   const read = deps.readFile ?? readFile;
 
@@ -50,6 +53,15 @@ export async function buildDashData({ dir = RECORDER.dir, now = Date.now() } = {
       /* a file that vanished mid-read must not fail the whole screen */
     }
   }
+
+  // The BOT's book, read rather than re-derived.
+  //
+  // This screen used to show no positions at all while Telegram showed open
+  // trades and a running loss, because the bot held its portfolio only in memory
+  // and this process had no way to see it. Two sources of truth, guaranteed to
+  // disagree. Now the bot publishes and this reads: whatever the numbers are,
+  // both screens quote the same ones.
+  const journal = await loadJournal({ dir: journalDir }, deps);
 
   const { rows, ticks } = buildWatchlist(lines);
   const snap = await latestSnapshot({ dir, now }, deps);
@@ -75,6 +87,10 @@ export async function buildDashData({ dir = RECORDER.dir, now = Date.now() } = {
         symbol: r.symbol,
         seen: r.seen,
         ageHours: (now - r.firstTs) / MS_PER_HOUR,
+        firstTs: r.firstTs,
+        lastSeenTs: r.lastSeenTs,
+        entryPriceUsd: r.entryPriceUsd ?? null,
+        entryMarketCapUsd: r.entryMarketCapUsd ?? null,
         entryLiquidityUsd: r.entryLiquidityUsd,
         nowLiquidityUsd: nowLiq,
         measured: measured !== null,
@@ -87,6 +103,43 @@ export async function buildDashData({ dir = RECORDER.dir, now = Date.now() } = {
     })
     .sort((a, b) => (a.changePct ?? 0) - (b.changePct ?? 0));
 
+  // A token is in the recording only while it passes the screen, and the feed
+  // itself rotates, so the set changes almost every tick: measured over 8
+  // consecutive ticks, Hailey and BADGERS left, C4T arrived and left, Hezbollah
+  // and Pistacio arrived, Pistacio left. Showing only the newest snapshot makes
+  // that look like tokens vanishing at random.
+  //
+  // So keep a window of what was seen recently and mark whether it is still
+  // there. LEFT is a real state worth seeing, not an absence to hide -- though
+  // the recording cannot say WHICH of the two reasons applies, because a token
+  // that stopped trending and a token that stopped qualifying both simply stop
+  // being recorded. That limit is stated in the UI rather than papered over.
+  const latestTickTs = ticks.length > 0 ? ticks[ticks.length - 1].ts : null;
+  const windowMs = RECENT_WINDOW_TICKS * RECORDER.snapshotIntervalSeconds * 1000;
+  const recent =
+    latestTickTs === null
+      ? []
+      : rows
+          .filter((r) => r.lastSeenTs >= latestTickTs - windowMs)
+          .map((r) => {
+            const ticksSince = ticks.filter((t) => t.ts > r.lastSeenTs).length;
+            const inLatest = r.lastSeenTs === latestTickTs;
+            return Object.freeze({
+              mint: r.mint,
+              symbol: r.symbol,
+              seen: r.seen,
+              inLatest,
+              ticksSince,
+              lastSeenTs: r.lastSeenTs,
+              firstTs: r.firstTs,
+              gateBuyable: r.gateBuyable,
+              gateBlockedBy: Object.freeze([...(r.gateBlockedBy ?? [])]),
+              liquidityUsd:
+                [...r.series].reverse().find((x) => Number.isFinite(x.liq))?.liq ?? null,
+            });
+          })
+          .sort((a, b) => b.lastSeenTs - a.lastSeenTs || (a.symbol ?? '').localeCompare(b.symbol ?? ''));
+
   return Object.freeze({
     generatedAt: now,
     recorder: Object.freeze({
@@ -97,6 +150,13 @@ export async function buildDashData({ dir = RECORDER.dir, now = Date.now() } = {
       fileCount: files.length,
     }),
     ticks,
+    recent: Object.freeze(recent),
+    // The full sweep of the newest tick, rejects included, each with the FIRST
+    // reason the screen threw it out. This is what makes the interface show
+    // continuous work: most ticks approve nothing, and without the rejects there
+    // is nothing on screen to distinguish "scanning hard, liked none of it" from
+    // "dead". Empty for recordings written before the recorder kept them.
+    scanned: Object.freeze(snap.scanned ?? []),
     lastScan: Object.freeze(
       snap.candidates.map((c) =>
         Object.freeze({
@@ -120,6 +180,11 @@ export async function buildDashData({ dir = RECORDER.dir, now = Date.now() } = {
       ),
     ),
     history: Object.freeze(history),
+    paper: Object.freeze({
+      hasBook: journal.hasBook,
+      book: journal.book,
+      trades: journal.trades,
+    }),
     evidence: Object.freeze({
       tally,
       report,
@@ -131,6 +196,7 @@ export async function buildDashData({ dir = RECORDER.dir, now = Date.now() } = {
       positionSizeUsd: RISK.positionSizeUsd,
       minMarketCapUsd: STRATEGY.universe.minMarketCapUsd,
       maxMarketCapUsd: STRATEGY.universe.maxMarketCapUsd,
+      recentWindowTicks: RECENT_WINDOW_TICKS,
       autoLabelEveryMinutes: LABELS.autoLabelEveryMinutes,
       minAgeHoursBeforeLabelling: LABELS.minAgeHoursBeforeLabelling,
       RUGGED: LABEL.RUGGED,
@@ -150,8 +216,11 @@ export const EMPTY = Object.freeze({
     fileCount: 0,
   }),
   ticks: Object.freeze([]),
+  recent: Object.freeze([]),
+  scanned: Object.freeze([]),
   lastScan: Object.freeze([]),
   history: Object.freeze([]),
+  paper: Object.freeze({ hasBook: false, book: null, trades: Object.freeze([]) }),
   evidence: Object.freeze({
     tally: Object.freeze({
       snapshots: 0, uniqueMints: 0, approved: 0, rugged: 0, unlabelled: 0,
@@ -166,6 +235,7 @@ export const EMPTY = Object.freeze({
     positionSizeUsd: RISK.positionSizeUsd,
     minMarketCapUsd: STRATEGY.universe.minMarketCapUsd,
     maxMarketCapUsd: STRATEGY.universe.maxMarketCapUsd,
+    recentWindowTicks: RECENT_WINDOW_TICKS,
     autoLabelEveryMinutes: LABELS.autoLabelEveryMinutes,
     minAgeHoursBeforeLabelling: LABELS.minAgeHoursBeforeLabelling,
     RUGGED: LABEL.RUGGED,
