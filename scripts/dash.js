@@ -149,9 +149,30 @@ const usd = (n) =>
 const money = (n, signed = false) => {
   if (n === null || n === undefined || !Number.isFinite(n)) return '—';
   const a = Math.abs(n);
-  const body = a < 10 ? a.toFixed(2) : Math.round(a).toLocaleString('en-US');
+  // Cents up to $1,000, matching src/notify/format.js so the dashboard and
+  // Telegram never render the same figure differently. The old cutoff was $10,
+  // which showed a total of "-$10" directly above its own components of "-$8.40"
+  // and "-$2.00" and looked like an arithmetic error.
+  const body = a < 1_000 ? a.toFixed(2) : Math.round(a).toLocaleString('en-US');
   const sign = n < 0 ? '-' : signed ? '+' : '';
   return `${sign}$${body}`;
+};
+
+/**
+ * A token price, at enough precision to see it move.
+ *
+ * `usd` uses four decimals below $10, which renders a token at $0.00032 as
+ * "$0.0003" -- the same string it shows after a 15% move, so the open position's
+ * "in" and "now" columns looked identical while the price was actually changing.
+ * Four significant digits scales with the number.
+ */
+const price = (n) => {
+  if (n === null || n === undefined || !Number.isFinite(n)) return '—';
+  if (n === 0) return '$0';
+  const a = Math.abs(n);
+  if (a >= 1) return `$${n.toFixed(2)}`;
+  const digits = Math.min(12, Math.max(2, 3 - Math.floor(Math.log10(a))));
+  return `$${n.toFixed(digits)}`;
 };
 
 const pct = (n) =>
@@ -415,11 +436,7 @@ function Watching({ recent, rows, config, width }) {
       Box,
       { gap: 1 },
       h(Text, { bold: true }, 'RECENTLY SEEN'),
-      h(
-        Text,
-        { dimColor: true },
-        `last ${config.recentWindowTicks} ticks · they rotate out of the feed, they are not deleted`,
-      ),
+      h(Text, { dimColor: true }, `last ${config.recentWindowTicks} ticks`),
     ),
     ...visible.map((r) =>
       h(
@@ -632,13 +649,7 @@ function LiveView({ data, rows, width, pageTick, selected, showDetail, canType }
                 ),
             ].filter(Boolean);
           }),
-          h(
-            Text,
-            { dimColor: true },
-            canType
-              ? '↑/↓ move · enter or space for the address and the full reason'
-              : 'SAFE? is the gate. ENTER? is the momentum rules. Different questions.',
-          ),
+
         ),
     detail !== null && h(Text, null, ''),
     detail !== null && h(CandidateDetail, { row: detail, width: width - 2 }),
@@ -771,7 +782,24 @@ function HistoryView({ data, rows, width, selected, showDetail, canType }) {
  * answered from its own state. A reader that recomputes is a second brain, and
  * two brains eventually disagree about money.
  */
-function PositionsView({ data, rows, width, selected, showDetail, canType }) {
+/**
+ * The age of a position's last price.
+ *
+ * Red past two minutes: the bot marks every cycle, so anything older means it
+ * could not get a price, and an unpriced position is one the exit rules cannot
+ * act on.
+ */
+const MarkAge = ({ ts, now }) => {
+  if (!Number.isFinite(ts)) return h(Cell, { w: 14, color: 'red' }, 'never marked');
+  const s = Math.max(0, Math.round((now - ts) / 1_000));
+  return h(
+    Cell,
+    { w: 14, color: s > 120 ? 'red' : 'gray', bold: s > 120 },
+    s > 120 ? `STALE ${Math.round(s / 60)}m` : `marked ${s}s ago`,
+  );
+};
+
+function PositionsView({ data, rows, width, selected, showDetail, canType, nowMs }) {
   const { hasBook, book, trades } = data.paper;
 
   if (!hasBook) {
@@ -846,14 +874,18 @@ function PositionsView({ data, rows, width, selected, showDetail, canType }) {
         Box,
         { key: p.mint },
         h(Cell, { w: 12, bold: true }, (p.symbol ?? p.mint.slice(0, 8)).slice(0, 10)),
-        h(Cell, { w: 9, dimColor: true }, money(p.sizeUsd)),
-        width > 48 && h(Cell, { w: 13, dimColor: true }, `in ${usd(p.entryPriceUsd)}`),
-        width > 62 && h(Cell, { w: 13, dimColor: true }, `now ${usd(p.lastPriceUsd)}`),
+        h(Cell, { w: 8, dimColor: true }, money(p.sizeUsd)),
+        width > 48 && h(Cell, { w: 15, dimColor: true }, `in ${price(p.entryPriceUsd)}`),
+        width > 64 && h(Cell, { w: 16, dimColor: true }, `now ${price(p.lastPriceUsd)}`),
         h(
           Cell,
-          { w: 11, color: (p.unrealisedPnlUsd ?? 0) >= 0 ? 'green' : 'red', bold: true },
+          { w: 10, color: (p.unrealisedPnlUsd ?? 0) >= 0 ? 'green' : 'red', bold: true },
           money(p.unrealisedPnlUsd, true),
         ),
+        // How old this mark is, because a stale one is not a calm position -- it
+        // is an unmanaged one. With no current price the stop loss has nothing to
+        // compare against, so this number is a safety readout, not a detail.
+        width > 80 && h(MarkAge, { ts: p.lastMarkTs, now: nowMs }),
       ),
     ),
     h(Text, null, ''),
@@ -929,7 +961,7 @@ function PositionsView({ data, rows, width, selected, showDetail, canType }) {
         h(Text, { wrap: 'wrap' }, detail.mint),
         h(Text, null, ''),
         h(Field, { label: 'size' }, money(detail.sizeUsd)),
-        h(Field, { label: 'in then out' }, `${usd(detail.entryPriceUsd)}  to  ${usd(detail.exitPriceUsd)}`),
+        h(Field, { label: 'in then out' }, `${price(detail.entryPriceUsd)}  to  ${price(detail.exitPriceUsd)}`),
         // Gross beside net, so the cost of trading is visible rather than folded
         // into one number. On a $40 position the two legs are most of the answer.
         h(
@@ -947,12 +979,6 @@ function PositionsView({ data, rows, width, selected, showDetail, canType }) {
         h(Text, null, ''),
         h(Links, { mint: detail.mint }),
       ),
-    h(Text, null, ''),
-    h(
-      Text,
-      { dimColor: true, wrap: 'wrap' },
-      'Published by the bot, not recomputed here — the same figures Telegram sends.',
-    ),
   );
 }
 
@@ -971,14 +997,7 @@ function EvidenceView({ data }) {
   return h(
     Box,
     { flexDirection: 'column' },
-    h(
-      Text,
-      { wrap: 'wrap' },
-      h(Text, { bold: true }, 'The question: '),
-      'of the tokens the gate approved, what fraction later rugged — against the ',
-      h(Text, { bold: true }, `${baseRatePct}%`),
-      ' population base rate?',
-    ),
+    h(Text, { bold: true }, `Of the tokens the gate approved, how many rugged? (base rate ${baseRatePct}%)`),
     h(Text, null, ''),
     ...rows.map(([k, v], i) =>
       h(Box, { key: i }, h(Cell, { w: 24, dimColor: true }, k), h(Text, null, v)),
@@ -1215,6 +1234,9 @@ export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail 
   // nothing extra. process.memoryUsage() is a syscall-free read of V8 counters.
   const heapMb = Math.round(process.memoryUsage().heapUsed / 1_048_576);
   const pageTick = Math.floor((frame * FRAME_MS) / (SCAN_PAGE_SECONDS * MS_PER_SECOND));
+  // Quantised to 10s so it is a fresh-enough clock for "marked 40s ago" without
+  // invalidating the memoised body once a second.
+  const nowMs = Math.floor(Date.now() / 10_000) * 10_000;
 
   const status = data.recorder.healthy
     ? h(
@@ -1255,6 +1277,10 @@ export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail 
       data,
       view,
       error,
+      // Coarse on purpose. The mark age only needs to be roughly right, and a
+      // per-second value here would re-render the whole body every second and
+      // undo the memoisation that stopped this process leaking.
+      nowMs,
       selected,
       showDetail,
       canType,
@@ -1286,6 +1312,7 @@ const Body = memo(function Body({
   inner,
   termCols,
   rows,
+  nowMs,
 }) {
   return h(
     Box,
@@ -1329,7 +1356,7 @@ const Body = memo(function Body({
       error !== null
         ? h(Text, { color: 'red', wrap: 'wrap' }, `read failed: ${error}`)
         : view === 'positions'
-          ? h(PositionsViewMemo, { data, rows, width: inner, selected, showDetail, canType })
+          ? h(PositionsViewMemo, { data, rows, width: inner, selected, showDetail, canType, nowMs })
           : view === 'history'
             ? h(HistoryViewMemo, { data, rows, width: inner, selected, showDetail, canType })
             : view === 'evidence'

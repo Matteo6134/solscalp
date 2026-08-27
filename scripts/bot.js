@@ -262,7 +262,7 @@ export async function main(argv, injected = {}) {
 
 /* -------------------------------------------------------------------------- */
 
-async function cycle({ state, notifier, deps, universe, paperEnabled, limit, fromRecording, paperDir }) {
+export async function cycle({ state, notifier, deps, universe, paperEnabled, limit, fromRecording, paperDir }) {
   const at = deps.now();
   let screened;
   let gateResults;
@@ -329,6 +329,37 @@ async function cycle({ state, notifier, deps, universe, paperEnabled, limit, fro
     );
   }
   const held = Object.keys(state.engine.portfolio.positions);
+
+  // PRICE THE POSITIONS WE HOLD, EVEN WHEN THEY NO LONGER QUALIFY.
+  //
+  // The recorder stores only tokens that PASS the universe screen, and tokens
+  // fall out of it constantly. On the recording path that left a held position
+  // with no price at all: measured 6.1 minutes with no mark on an open position,
+  // its unrealised P&L frozen at exactly the entry price.
+  //
+  // Frozen P&L is the harmless half. The dangerous half is that decideExit
+  // compares the CURRENT price against the stop -- so with no price there is no
+  // comparison, and the stop loss, the take profit and the trailing stop all
+  // silently stop working. A position that drops out of the feed became an
+  // unmanaged position.
+  //
+  // Fetching them directly reintroduces an upstream call, which is what making
+  // the bot a reader was meant to avoid. It is worth it and it is bounded: at
+  // most RISK.maxConcurrentPositions mints, batched into a single request, only
+  // when one is actually missing. That is one request a minute against a limit
+  // measured in tens, not the per-pool scanning that caused the original problem.
+  const unpriced = held.filter((m) => !pairs.some((p) => p.mint === m));
+  if (unpriced.length > 0) {
+    try {
+      const extra = await deps.fetchPairs(unpriced);
+      pairs = [...pairs, ...[...extra.values()].filter((p) => p !== null)];
+    } catch (err) {
+      // Leave them unmarked rather than guessing a price. The dashboard shows
+      // each mark's age, so an unpriceable position is visible rather than silent.
+      say(`[mark] could not price ${unpriced.length} held position(s): ${describeError(err)}`);
+    }
+  }
+
   const gateLimit = pLimit(GATE_CONCURRENCY);
 
   const solPriceUsd = solPriceFrom(pairs);
@@ -398,7 +429,12 @@ async function cycle({ state, notifier, deps, universe, paperEnabled, limit, fro
 
   // The signal alert: gate passed AND the rules fired. Nothing else earns a buzz.
   for (const c of candidates) {
-    if (!c.gate.buyable || !c.entry.enter) continue;
+    // Optional access, and fail-closed by construction: a candidate whose gate
+    // or entry decision is missing is NOT alerted. It reached this loop from a
+    // recording, so a malformed or partial record is possible, and the previous
+    // direct access turned one bad candidate into a TypeError that killed the
+    // whole cycle -- including the exit management of every open position.
+    if (c.gate?.buyable !== true || c.entry?.enter !== true) continue;
     if (!NOTIFY.events.wouldEnter || state.alertsPaused) continue;
     await notifier.send(
       formatSignal({ mint: c.mint, symbol: c.symbol, signals: c.signals, costs: c.entry.costs }),

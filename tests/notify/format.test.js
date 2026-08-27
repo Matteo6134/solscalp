@@ -6,6 +6,7 @@ import {
   formatClosed,
   formatGate,
   formatHelp,
+  formatOpened,
   formatPositions,
   formatRecheckFailed,
   formatSignal,
@@ -253,5 +254,65 @@ describe('COMMANDS / formatHelp', () => {
   it('lists every command with a description', () => {
     const help = formatHelp();
     for (const c of COMMANDS) expect(help).toContain(`/${c.command}`);
+  });
+});
+
+describe('money and price formatting in alerts', () => {
+  /**
+   * `usd` branches on `n < 1`, which EVERY negative number satisfies -- so a
+   * realised loss of -9.2 went through the six-decimal price branch and was sent
+   * to Telegram as "$-9.200000", with the minus inside the currency and four
+   * digits of invented precision.
+   */
+  it('a loss reads as -$9.20, not $-9.200000', () => {
+    const out = formatClosed({
+      symbol: 'X',
+      trade: {
+        mint: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+        netPnlUsd: -9.2,
+        netPnlPct: -23,
+        totalCostUsd: 1.28,
+        holdMs: 2_700_000,
+        entryPriceUsd: 0.00032418,
+        exitPriceUsd: 0.00030473,
+        reason: 'stopLoss',
+      },
+    });
+
+    expect(out).toContain('-$9.20');
+    expect(out).not.toContain('$-9');
+    expect(out).not.toContain('9.200000');
+  });
+
+  /**
+   * Fixed decimals cannot serve a range from $12 to $0.0000004. At four decimal
+   * places a token at $0.00032 and the same token 15% later both render as
+   * "$0.0003", which is why the open position's in/now columns looked identical
+   * while the price was moving.
+   */
+  it('small prices keep enough significant digits to show a move', () => {
+    const at = (p) =>
+      formatOpened({ mint: 'M', symbol: 'X', sizeUsd: 40, entryPriceUsd: p });
+
+    expect(at(0.00032418)).toContain('$0.0003242');
+    // The distinguishing property: two prices 15% apart must not print the same.
+    const a = at(0.00032418);
+    const bb = at(0.00032418 * 1.15);
+    expect(a).not.toEqual(bb);
+  });
+
+  it('opens and closes both carry a tappable chart and holder link', () => {
+    const mint = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
+    const opened = formatOpened({ mint, symbol: 'X', sizeUsd: 40, entryPriceUsd: 0.001 });
+    const closed = formatClosed({
+      symbol: 'X',
+      trade: { mint, netPnlUsd: 1, netPnlPct: 2, totalCostUsd: 1, holdMs: 60_000, entryPriceUsd: 0.001, exitPriceUsd: 0.0011, reason: 'takeProfit' },
+    });
+
+    for (const msg of [opened, closed]) {
+      expect(msg).toContain(`dexscreener.com/solana/${mint}`);
+      expect(msg).toContain(`solscan.io/token/${mint}`);
+      expect(msg).toContain('<a href=');
+    }
   });
 });

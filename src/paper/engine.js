@@ -269,14 +269,14 @@ export function decideEntry({
     signals.priceChangeM5Pct >= cfg.minPriceChangeM5Pct,
     signals.priceChangeM5Pct,
     '5m price change',
-    `5m change ${fmt(signals.priceChangeM5Pct)}% below minimum ${cfg.minPriceChangeM5Pct}%`,
+    `5m change ${fmt(signals.priceChangeM5Pct, cfg.minPriceChangeM5Pct)}% below minimum ${cfg.minPriceChangeM5Pct}%`,
   );
   require_(
     reasons,
     signals.priceChangeM5Pct <= cfg.maxPriceChangeM5Pct,
     signals.priceChangeM5Pct,
     '5m price change',
-    `5m change ${fmt(signals.priceChangeM5Pct)}% above maximum ${cfg.maxPriceChangeM5Pct}% ` +
+    `5m change ${fmt(signals.priceChangeM5Pct, cfg.maxPriceChangeM5Pct)}% above maximum ${cfg.maxPriceChangeM5Pct}% ` +
       '(already vertical -- we would be the exit liquidity)',
   );
   require_(
@@ -284,14 +284,14 @@ export function decideEntry({
     signals.priceChangeH1Pct >= cfg.minPriceChangeH1Pct,
     signals.priceChangeH1Pct,
     '1h price change',
-    `1h change ${fmt(signals.priceChangeH1Pct)}% below minimum ${cfg.minPriceChangeH1Pct}%`,
+    `1h change ${fmt(signals.priceChangeH1Pct, cfg.minPriceChangeH1Pct)}% below minimum ${cfg.minPriceChangeH1Pct}%`,
   );
   require_(
     reasons,
     signals.buySellRatioM5 >= cfg.minBuySellRatioM5,
     signals.buySellRatioM5,
     '5m buy/sell ratio',
-    `5m buy/sell ${fmt(signals.buySellRatioM5)} below minimum ${cfg.minBuySellRatioM5} ` +
+    `5m buy/sell ${fmt(signals.buySellRatioM5, cfg.minBuySellRatioM5)} below minimum ${cfg.minBuySellRatioM5} ` +
       '(the move is being sold into)',
   );
   require_(
@@ -371,7 +371,7 @@ export function universeReasons(pair, now, universe, precomputed) {
     signals.marketCapUsd <= uni.maxMarketCapUsd,
     signals.marketCapUsd,
     'market cap',
-    `market cap ${fmt(signals.marketCapUsd)} above ceiling ${uni.maxMarketCapUsd} ` +
+    `market cap ${fmt(signals.marketCapUsd, uni.maxMarketCapUsd)} above ceiling ${uni.maxMarketCapUsd} ` +
       '(too big to multiply)',
   );
   require_(
@@ -379,7 +379,7 @@ export function universeReasons(pair, now, universe, precomputed) {
     signals.marketCapUsd >= uni.minMarketCapUsd,
     signals.marketCapUsd,
     'market cap',
-    `market cap ${fmt(signals.marketCapUsd)} below floor ${uni.minMarketCapUsd} ` +
+    `market cap ${fmt(signals.marketCapUsd, uni.minMarketCapUsd)} below floor ${uni.minMarketCapUsd} ` +
       '(no float to exit into)',
   );
   require_(
@@ -387,14 +387,14 @@ export function universeReasons(pair, now, universe, precomputed) {
     signals.volumeH1Usd >= uni.minVolumeH1Usd,
     signals.volumeH1Usd,
     '1h volume',
-    `1h volume ${fmt(signals.volumeH1Usd)} below minimum ${uni.minVolumeH1Usd}`,
+    `1h volume ${fmt(signals.volumeH1Usd, uni.minVolumeH1Usd)} below minimum ${uni.minVolumeH1Usd}`,
   );
   require_(
     reasons,
     signals.txnsH1 >= uni.minTxnsH1,
     signals.txnsH1,
     '1h txns',
-    `1h txns ${fmt(signals.txnsH1)} below minimum ${uni.minTxnsH1}`,
+    `1h txns ${fmt(signals.txnsH1, uni.minTxnsH1)} below minimum ${uni.minTxnsH1}`,
   );
   if (signals.quoteMint === null) {
     reasons.push('quote mint unknown: cannot confirm a SOL/USDC-quoted pair (fail closed)');
@@ -422,9 +422,27 @@ export function universeReasons(pair, now, universe, precomputed) {
 }
 
 /** Compact number for a reason string; 'unknown' for null. */
-function fmt(v) {
+/**
+ * A number for a refusal message, at enough precision to stay TRUE.
+ *
+ * Two decimals produced self-contradicting reasons: a buy/sell ratio of 1.2996
+ * against a minimum of 1.3 printed as "1.30 below minimum 1.3", which reads as a
+ * bug in the rule rather than a marginal token. When the rounded value would
+ * print as equal to the threshold it is compared against, show more digits.
+ *
+ * @param {number|null} v
+ * @param {number} [limit] the threshold this value is being reported against
+ */
+function fmt(v, limit) {
   if (v === null) return 'unknown';
-  return Math.abs(v) >= 1000 ? Math.round(v).toString() : v.toFixed(2);
+  if (Math.abs(v) >= 1000) return Math.round(v).toString();
+  const two = v.toFixed(2);
+  if (limit !== undefined && Number(two) === Number(limit)) {
+    // Enough to separate them, and trailing zeroes trimmed so a clear-cut case
+    // never gains noise from a rule that exists for the marginal ones.
+    return v.toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
+  }
+  return two;
 }
 
 /* -------------------------------------------------------------------------- */

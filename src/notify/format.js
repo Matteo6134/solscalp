@@ -38,6 +38,39 @@ const usd = (n) =>
       ? `$${n.toFixed(6)}`
       : `$${Math.round(n).toLocaleString('en-US')}`;
 
+/**
+ * A token price, at enough precision to see it move.
+ *
+ * Fixed decimal places cannot do this job. These tokens trade from $12 down to
+ * $0.0000004, and any single number of decimals either drowns the big ones in
+ * zeroes or rounds the small ones to nothing -- a memecoin at $0.00032 rendered
+ * as "$0.0003", which is the same string it shows after a 15% move. Four
+ * SIGNIFICANT digits scales with the number instead.
+ */
+const price = (n) => {
+  if (n === null || n === undefined || !Number.isFinite(n)) return 'n/a';
+  if (n === 0) return '$0';
+  const a = Math.abs(n);
+  if (a >= 1) return `$${n.toFixed(2)}`;
+  const digits = Math.min(12, Math.max(2, 3 - Math.floor(Math.log10(a))));
+  return `$${n.toFixed(digits)}`;
+};
+
+/**
+ * A signed dollar amount.
+ *
+ * `usd` above branches on `n < 1`, which every negative number satisfies -- so a
+ * realised loss of -9.2 was formatted through the six-decimal price branch and
+ * sent to Telegram as "$-9.200000". Money that can be negative needs its own
+ * formatter, with the sign outside the currency.
+ */
+const money = (n) => {
+  if (n === null || n === undefined || !Number.isFinite(n)) return 'n/a';
+  const a = Math.abs(n);
+  const body = a < 1_000 ? a.toFixed(2) : Math.round(a).toLocaleString('en-US');
+  return `${n < 0 ? '-' : ''}$${body}`;
+};
+
 const pct = (n) =>
   n === null || n === undefined || !Number.isFinite(n)
     ? 'n/a'
@@ -48,6 +81,21 @@ const num = (n, digits = 1) =>
 
 /** Dexscreener link, so the alert is one tap from a chart. */
 const chartLink = (mint) => `https://dexscreener.com/solana/${encodeURIComponent(mint)}`;
+
+/**
+ * Both links as tappable markup: the chart, and the holder list.
+ *
+ * A bare mint address in a message is not something you can act on from a phone.
+ * Copying 44 characters out of a chat is the friction that stops anyone
+ * checking, which defeats the point of the alert. The signal alert already
+ * linked the chart; the OPEN and CLOSE messages did not, so a position you were
+ * told about could not be followed by hand.
+ */
+const links = (mint) =>
+  typeof mint === 'string' && mint !== ''
+    ? `<a href="${chartLink(mint)}">chart</a> · ` +
+      `<a href="https://solscan.io/token/${encodeURIComponent(mint)}">holders</a>`
+    : '';
 
 /**
  * The only alert that means "look now": gate passed AND the entry rules fired.
@@ -71,7 +119,7 @@ export function formatSignal({ mint, symbol, signals, costs }) {
         `(betting on ${STRATEGY.entry.expectedGrossMovePct}%)`,
     '',
     `<code>${escapeHtml(mint)}</code>`,
-    `<a href="${chartLink(mint)}">chart</a>`,
+    links(mint),
     '',
     '<i>Gate passed = the creator probably cannot steal your tokens. It does NOT',
     'mean profitable, and a soft rug — a dev quietly selling into buyers —',
@@ -85,9 +133,10 @@ export function formatSignal({ mint, symbol, signals, costs }) {
 export function formatOpened({ mint, symbol, sizeUsd, entryPriceUsd, signals }) {
   return [
     `📈 <b>PAPER OPEN</b> ${escapeHtml(symbol ?? '?')}`,
-    `size ${usd(sizeUsd)} @ ${usd(entryPriceUsd)}`,
+    `size ${money(sizeUsd)} @ ${price(entryPriceUsd)}`,
     signals ? `mcap ${usd(signals.marketCapUsd)}   liq ${usd(signals.liquidityUsd)}` : '',
     `<code>${escapeHtml(mint)}</code>`,
+    links(mint),
     '<i>paper only — no order was placed</i>',
   ]
     .filter((l) => l !== '')
@@ -99,10 +148,13 @@ export function formatClosed({ symbol, trade }) {
   const win = trade.netPnlUsd > 0;
   return [
     `${win ? '✅' : '🔻'} <b>PAPER CLOSE</b> ${escapeHtml(symbol ?? '?')} — ${escapeHtml(trade.reason)}`,
-    `net <b>${usd(trade.netPnlUsd)}</b> (${pct(trade.netPnlPct)}) after ${usd(trade.totalCostUsd)} costs`,
-    `held ${Math.round(trade.holdMs / 60_000)}m`,
+    `net <b>${money(trade.netPnlUsd)}</b> (${pct(trade.netPnlPct)}) after ${money(trade.totalCostUsd)} costs`,
+    `${price(trade.entryPriceUsd)} → ${price(trade.exitPriceUsd)} · held ${Math.round(trade.holdMs / 60_000)}m`,
+    links(trade.mint),
     '<i>paper only</i>',
-  ].join('\n');
+  ]
+    .filter((l) => l !== '')
+    .join('\n');
 }
 
 /** A held token started failing its recheck. This is the urgent one. */
