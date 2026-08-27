@@ -101,6 +101,32 @@ const SCAN_PAGE_SECONDS = 4;
  * A dashboard that knows it is dying should say so while it still can. Node's
  * default old-space ceiling is about 4GB, so warn at 1.5 and get loud at 2.8.
  */
+/**
+ * Chart windows, and the honest caveat attached to them.
+ *
+ * A one-second chart was asked for and cannot be built. Every price on this
+ * screen comes from the bot's publish, the bot cycles once a MINUTE, and the
+ * upstream feed is not per-second either -- so one point a minute is the floor
+ * for the whole system. Drawing a 1s axis over 60s samples would be a picture of
+ * data that does not exist. These are windows over real points instead, and the
+ * chart states its own resolution.
+ */
+const WINDOWS = Object.freeze([
+  { key: '15m', ms: 15 * 60_000 },
+  { key: '1h', ms: 60 * 60_000 },
+  { key: '6h', ms: 6 * 60 * 60_000 },
+  { key: 'all', ms: Infinity },
+]);
+
+/** History groupings. Each is a submenu over the same list. */
+const GROUPS = Object.freeze([
+  { key: 'all', label: 'ALL', match: () => true },
+  { key: 'open', label: 'unlabelled', match: (r, c) => r.label !== c.RUGGED && r.label !== c.SURVIVED },
+  { key: 'rugged', label: 'rugged', match: (r, c) => r.label === c.RUGGED },
+  { key: 'survived', label: 'survived', match: (r, c) => r.label === c.SURVIVED },
+  { key: 'safe', label: 'gate passed', match: (r) => r.gateBuyable === true },
+]);
+
 const HEAP_WARN_MB = 1_500;
 const HEAP_URGENT_MB = 2_800;
 
@@ -123,10 +149,13 @@ is safe to leave running next to the recorder and the bot.
   --paper-dir P  the bot's journal directory (default ${JOURNAL.dir})
   --cols N     force a width instead of asking the terminal
   --detail     open the detail panel on the first row immediately
+  --window W   chart window: 15m | 1h | 6h | all
 
   1 2 3 4      switch view        <- / ->     also switch
-  r            re-read now        q           quit
-  up / down    move selection     enter/space token details
+  up / down    move selection     enter/space  open the detail panel
+  /            search history     g            cycle the history group
+  t            chart timeframe    r            re-read now
+  q            quit
 `;
 
 /* ------------------------------------------------------------------ format */
@@ -274,6 +303,136 @@ export function rotate(total, page, tick) {
   const pages = Math.max(1, Math.ceil(total / size));
   const at = pages <= 1 ? 0 : ((tick % pages) + pages) % pages;
   return { start: at * size, pages, at };
+}
+
+/**
+ * Narrow the history list to one group and one search term.
+ *
+ * Exported and pure so the filtering is testable without a terminal, and so the
+ * App can size the cursor against the SAME list the view draws -- a cursor
+ * clamped to the unfiltered length would point past the end of a filtered one.
+ *
+ * @param {readonly object[]} history
+ * @param {string} group a GROUPS key
+ * @param {string} query case-insensitive substring of symbol or mint
+ * @param {object} config for the label constants
+ */
+export function filterHistory(history, group, query, config) {
+  const g = GROUPS.find((x) => x.key === group) ?? GROUPS[0];
+  const q = query.trim().toLowerCase();
+  return history.filter((r) => {
+    if (!g.match(r, config)) return false;
+    if (q === '') return true;
+    return (
+      (r.symbol ?? '').toLowerCase().includes(q) || (r.mint ?? '').toLowerCase().includes(q)
+    );
+  });
+}
+
+/** Counts per group, for the submenu bar. */
+export function groupCounts(history, config) {
+  return GROUPS.map((g) => ({
+    key: g.key,
+    label: g.label,
+    n: history.filter((r) => g.match(r, config)).length,
+  }));
+}
+
+/**
+ * A price chart in block characters.
+ *
+ * Coloured PER ROW rather than per column, which is not a shortcut: a row is one
+ * price level, so every point on it sits on the same side of the entry price.
+ * That makes one Text per row correct as well as cheap -- and cheap matters here,
+ * because Ink leaks per rendered node (see the note at the top of this file).
+ *
+ * @param {object} p
+ * @param {readonly {ts:number,priceUsd:number}[]} p.points
+ * @param {number|null} p.entryUsd drawn as a reference line
+ * @param {number} p.width
+ * @param {number} [p.height]
+ */
+function Chart({ points, entryUsd, width, height = 7 }) {
+  const cols = Math.max(8, width - 24);
+  if (points.length === 0) {
+    return h(Text, { dimColor: true }, 'no price points in this window yet');
+  }
+  if (points.length === 1) {
+    return h(
+      Text,
+      { dimColor: true },
+      `one point so far (${price(points[0].priceUsd)}) — a line needs two`,
+    );
+  }
+
+  // Sample to the available columns. Fewer points than columns draws them all.
+  const step = points.length <= cols ? 1 : (points.length - 1) / (cols - 1);
+  const sampled =
+    points.length <= cols
+      ? points
+      : Array.from({ length: cols }, (_, i) => points[Math.round(i * step)]);
+  const vals = sampled.map((pt) => pt.priceUsd);
+  // The entry price is inside the range on purpose, so its line is always drawn
+  // rather than clipped off the top or bottom when the position only moved away.
+  const withEntry = Number.isFinite(entryUsd) ? [...vals, entryUsd] : vals;
+  const lo = Math.min(...withEntry);
+  const hi = Math.max(...withEntry);
+  const span = hi - lo || 1;
+  const rowOf = (v) => Math.min(height - 1, Math.max(0, Math.round(((hi - v) / span) * (height - 1))));
+  const entryRow = Number.isFinite(entryUsd) ? rowOf(entryUsd) : -1;
+
+  const grid = Array.from({ length: height }, () => new Array(sampled.length).fill(' '));
+  sampled.forEach((pt, i) => {
+    grid[rowOf(pt.priceUsd)][i] = '█';
+  });
+  if (entryRow >= 0) {
+    for (let i = 0; i < sampled.length; i += 1) if (grid[entryRow][i] === ' ') grid[entryRow][i] = '─';
+  }
+
+  const spanMin = Math.round((sampled.at(-1).ts - sampled[0].ts) / 60_000);
+  return h(
+    Box,
+    { flexDirection: 'column' },
+    ...grid.map((row, r) =>
+      h(
+        Box,
+        { key: r },
+        h(
+          Text,
+          {
+            wrap: 'truncate',
+            // Above the entry row is a higher price, so green; below is red. The
+            // entry row itself is neither.
+            color: entryRow < 0 ? 'cyan' : r < entryRow ? 'green' : r > entryRow ? 'red' : 'gray',
+            dimColor: r === entryRow,
+          },
+          row.join(''),
+        ),
+        h(
+          Text,
+          { dimColor: true, wrap: 'truncate' },
+          // Labels ACCUMULATE rather than take priority. When a position has only
+          // moved one way the entry price IS the high or the low, and an
+          // either/or chain silently dropped the entry label exactly when the
+          // reference line mattered most.
+          [
+            r === 0 ? price(hi) : null,
+            r === height - 1 ? price(lo) : null,
+            r === entryRow ? `entry ${price(entryUsd)}` : null,
+          ]
+            .filter((x) => x !== null)
+            .map((x) => ' ' + x)
+            .join(''),
+        ),
+      ),
+    ),
+    h(
+      Text,
+      { dimColor: true },
+      `${sampled.length} point${sampled.length === 1 ? '' : 's'} over ${spanMin}m · ` +
+        'one per bot cycle (60s) — the finest this data has',
+    ),
+  );
 }
 
 /** A fixed-width cell. Ink truncates, so no manual width arithmetic. */
@@ -707,19 +866,21 @@ function TokenDetail({ row, config, width }) {
   );
 }
 
-function HistoryView({ data, rows, width, selected, showDetail, canType }) {
+function HistoryView({ data, visibleRows, rows, width, selected, showDetail, canType, group, query, searching }) {
   if (data.history.length === 0) {
     return h(Text, { dimColor: true }, 'Nothing recorded yet.');
   }
 
-  const detail = showDetail ? data.history[Math.min(selected, data.history.length - 1)] : null;
-  const bodyRows = Math.max(3, rows - (detail ? 22 : 9));
+  const counts = groupCounts(data.history, data.config);
+  const list = visibleRows;
+  const detail = showDetail && list.length > 0 ? list[Math.min(selected, list.length - 1)] : null;
+  const bodyRows = Math.max(3, rows - (detail ? 24 : 11));
 
   // Scroll the window to keep the selection inside it, and stop at both ends so
   // the last page is full rather than trailing off into blank rows.
   const half = Math.floor(bodyRows / 2);
-  const start = Math.min(Math.max(0, selected - half), Math.max(0, data.history.length - bodyRows));
-  const visible = data.history.slice(start, start + bodyRows);
+  const start = Math.min(Math.max(0, selected - half), Math.max(0, list.length - bodyRows));
+  const visible = list.slice(start, start + bodyRows);
 
   const cols = fitColumns(
     [
@@ -740,6 +901,48 @@ function HistoryView({ data, rows, width, selected, showDetail, canType }) {
   return h(
     Box,
     { flexDirection: 'column' },
+    // The submenu bar. 122 tokens in one flat list is unreadable, and most of
+    // them are settled cases -- the rugged ones especially, which are the bulk and
+    // the least interesting once labelled. Each group is the same list narrowed.
+    h(
+      Box,
+      { gap: 2 },
+      ...counts.map((c) =>
+        h(
+          Text,
+          {
+            key: c.key,
+            bold: c.key === group,
+            color: c.key === group ? 'cyan' : undefined,
+            dimColor: c.key !== group,
+          },
+          `${c.label} ${c.n}`,
+        ),
+      ),
+      h(Text, { dimColor: true }, 'g'),
+    ),
+    searching
+      ? h(
+          Box,
+          { gap: 1 },
+          h(Text, { color: 'cyan', bold: true }, 'search:'),
+          h(Text, { bold: true }, `${query}█`),
+          h(Text, { dimColor: true }, 'enter keeps it · esc clears'),
+        )
+      : h(
+          Box,
+          null,
+          h(
+            Text,
+            { dimColor: true },
+            query === '' ? 'press / to search' : `filtered by "${query}" · / to edit · esc to clear`,
+          ),
+        ),
+    list.length === 0
+      ? h(Text, { color: 'yellow' }, 'Nothing matches. Change the group or the search.')
+      : h(
+          Box,
+          { flexDirection: 'column' },
     h(
       Box,
       null,
@@ -764,9 +967,10 @@ function HistoryView({ data, rows, width, selected, showDetail, canType }) {
     h(
       Text,
       { dimColor: true },
-      `${selected + 1} of ${data.history.length}, worst first` +
-        (canType ? ' · ↑/↓ move · enter or space for the address and full record' : ' · no keys in this terminal'),
+      `${selected + 1} of ${list.length}, worst first` +
+        (canType ? ' · up/down move · enter for the record' : ' · no keys in this terminal'),
     ),
+        ),
     detail !== null && h(Text, null, ''),
     detail !== null && h(TokenDetail, { row: detail, config: data.config, width: width - 2 }),
   );
@@ -799,8 +1003,154 @@ const MarkAge = ({ ts, now }) => {
   );
 };
 
-function PositionsView({ data, rows, width, selected, showDetail, canType, nowMs }) {
-  const { hasBook, book, trades } = data.paper;
+/**
+ * One list, two kinds of row: what is open, then what is closed.
+ *
+ * Exported because the App has to size the cursor against exactly this list --
+ * counting positions and trades separately in two places is how an off-by-one
+ * detail panel happens.
+ */
+export function positionRows(book, trades) {
+  if (book === null) return [];
+  return [
+    ...book.positions.map((p) => ({ kind: 'open', mint: p.mint, symbol: p.symbol, pos: p })),
+    // Newest closed first: the last thing that happened is the thing being asked
+    // about.
+    ...[...trades].reverse().map((t) => ({ kind: 'closed', mint: t.mint, symbol: t.symbol, trade: t })),
+  ];
+}
+
+/** Points inside the selected window, oldest first. */
+function windowed(series, mint, ms, now) {
+  const all = series[mint] ?? [];
+  if (!Number.isFinite(ms)) return all;
+  return all.filter((pt) => now - pt.ts <= ms);
+}
+
+/** Everything around one open position, including how close it is to an exit. */
+function OpenDetail({ row, series, window: win, nowMs, config, width }) {
+  const p = row.pos;
+  const movePct =
+    Number.isFinite(p.lastPriceUsd) && p.entryPriceUsd > 0
+      ? ((p.lastPriceUsd - p.entryPriceUsd) / p.entryPriceUsd) * 100
+      : null;
+  // Distance to each exit, which is the question an open position actually
+  // raises. Derived from the SAME config the engine uses, not restated numbers.
+  const toStop = movePct === null ? null : movePct + config.stopLossPct;
+  const toTake = movePct === null ? null : config.takeProfitPct - movePct;
+  const heldMin = Number.isFinite(p.openedTs) ? Math.round((nowMs - p.openedTs) / 60_000) : null;
+
+  return h(
+    Box,
+    { flexDirection: 'column' },
+    h(
+      Box,
+      { gap: 2 },
+      h(Text, { bold: true, color: 'cyan' }, row.symbol ?? '?'),
+      h(Text, { bold: true, color: (movePct ?? 0) >= 0 ? 'green' : 'red' }, pct(movePct)),
+      h(
+        Text,
+        { bold: true, color: (p.unrealisedPnlUsd ?? 0) >= 0 ? 'green' : 'red' },
+        money(p.unrealisedPnlUsd, true),
+      ),
+      h(Text, { dimColor: true }, `${WINDOWS.map((w) => (w.key === win ? `[${w.key}]` : w.key)).join(' ')}  t`),
+    ),
+    h(Chart, {
+      points: windowed(series, row.mint, WINDOWS.find((w) => w.key === win)?.ms ?? Infinity, nowMs),
+      entryUsd: p.entryPriceUsd,
+      width,
+    }),
+    h(Text, null, ''),
+    h(Field, { label: 'entry' }, `${price(p.entryPriceUsd)}   size ${money(p.sizeUsd)}`),
+    h(
+      Field,
+      { label: 'now' },
+      `${price(p.lastPriceUsd)}   ` +
+        (Number.isFinite(p.lastMarkTs)
+          ? `marked ${Math.max(0, Math.round((nowMs - p.lastMarkTs) / 1_000))}s ago`
+          : 'NEVER MARKED'),
+    ),
+    h(
+      Field,
+      { label: 'stop loss', color: toStop !== null && toStop < 2 ? 'red' : undefined },
+      toStop === null
+        ? 'unknown — no current price'
+        : `at ${pct(-config.stopLossPct)} · ${toStop.toFixed(1)} points away`,
+    ),
+    h(
+      Field,
+      { label: 'take profit' },
+      toTake === null
+        ? 'unknown — no current price'
+        : `at ${pct(config.takeProfitPct)} · ${toTake.toFixed(1)} points away`,
+    ),
+    h(
+      Field,
+      { label: 'time stop' },
+      heldMin === null
+        ? 'unknown'
+        : `held ${heldMin}m of ${config.timeStopMinutes}m` +
+          (heldMin >= config.timeStopMinutes ? '  — DUE' : ''),
+    ),
+    h(Field, { label: 'entry cost' }, money(p.entryCostUsd)),
+    h(Text, null, ''),
+    h(Links, { mint: row.mint }),
+  );
+}
+
+/** Everything around one closed trade. */
+function ClosedDetail({ row, series, window: win, nowMs, width }) {
+  const t = row.trade;
+  return h(
+    Box,
+    { flexDirection: 'column' },
+    h(
+      Box,
+      { gap: 2 },
+      h(Text, { bold: true, color: 'cyan' }, row.symbol ?? '?'),
+      h(
+        Text,
+        { color: (t.netPnlUsd ?? 0) >= 0 ? 'green' : 'red', bold: true },
+        `${money(t.netPnlUsd, true)}  ${pct(t.netPnlPct)}`,
+      ),
+      h(Text, { dimColor: true }, t.reason ?? ''),
+      h(Text, { dimColor: true }, `${WINDOWS.map((w) => (w.key === win ? `[${w.key}]` : w.key)).join(' ')}  t`),
+    ),
+    h(Chart, {
+      points: windowed(series, row.mint, WINDOWS.find((w) => w.key === win)?.ms ?? Infinity, nowMs),
+      entryUsd: t.entryPriceUsd,
+      width,
+    }),
+    h(Text, null, ''),
+    h(Field, { label: 'in then out' }, `${price(t.entryPriceUsd)}  to  ${price(t.exitPriceUsd)}`),
+    h(Field, { label: 'size' }, money(t.sizeUsd)),
+    h(
+      Field,
+      { label: 'gross then net' },
+      `${money(t.grossPnlUsd, true)}  minus ${money(t.totalCostUsd)} costs  =  ${money(t.netPnlUsd, true)}`,
+    ),
+    h(
+      Field,
+      { label: 'held' },
+      `${clock(t.openedTs)} to ${clock(t.closedTs)}` +
+        (Number.isFinite(t.holdMs) ? `   (${Math.round(t.holdMs / 60_000)} min)` : ''),
+    ),
+    h(Text, null, ''),
+    h(Links, { mint: row.mint }),
+  );
+}
+
+/**
+ * The paper book: the same numbers Telegram sends.
+ *
+ * Reads the bot's published journal and shows it verbatim. It derives nothing
+ * that the bot already decided -- not a P&L, not an equity figure. This screen
+ * showed no positions at all while Telegram reported open trades and a running
+ * loss, because the bot held its book only in memory. A reader that recomputes is
+ * a second brain, and two brains eventually disagree about money.
+ */
+function PositionsView({ data, rows, width, selected, showDetail, canType, nowMs, window: win }) {
+  const { hasBook, book, trades, series } = data.paper;
 
   if (!hasBook) {
     return h(
@@ -811,31 +1161,21 @@ function PositionsView({ data, rows, width, selected, showDetail, canType, nowMs
       h(
         Text,
         { dimColor: true, wrap: 'wrap' },
-        'Nothing here comes from the recording — this screen shows only what the bot ' +
-          'writes to its journal. Two reasons it can be empty: the bot is running without ' +
-          '--paper, so there is no book; or it has taken no trade yet, because it publishes ' +
-          'only when the book changes.',
-      ),
-      h(Text, null, ''),
-      h(
-        Text,
-        { color: 'yellow', wrap: 'wrap' },
-        'If Telegram IS reporting positions and this is empty, the running bot predates the ' +
-          'journal and has to be restarted: npm run stop, then npm run start.',
+        'It publishes when the book changes. Either it holds nothing yet, or it is ' +
+          'running without --paper.',
       ),
     );
   }
 
+  const list = positionRows(book, trades);
+  const sel = list[Math.min(selected, Math.max(0, list.length - 1))];
+  const detail = showDetail ? sel : null;
   const pnl = book.realisedPnlUsd + book.unrealisedPnlUsd;
-  const detail =
-    showDetail && trades.length > 0 ? trades[Math.min(selected, trades.length - 1)] : null;
-  const openRows = book.positions.length;
-  const tradeRows = Math.max(2, rows - 17 - openRows - (detail === null ? 0 : 14));
+  const listRows = Math.max(2, rows - 11 - (detail === null ? 0 : 20));
   const start = Math.min(
-    Math.max(0, selected - Math.floor(tradeRows / 2)),
-    Math.max(0, trades.length - tradeRows),
+    Math.max(0, selected - Math.floor(listRows / 2)),
+    Math.max(0, list.length - listRows),
   );
-  const visible = trades.slice(start, start + tradeRows);
 
   return h(
     Box,
@@ -850,6 +1190,7 @@ function PositionsView({ data, rows, width, selected, showDetail, canType, nowMs
         `${money(pnl, true)} all in`,
       ),
       h(Text, { dimColor: true }, `on a ${money(book.bookSizeUsd)} book`),
+      h(Text, { dimColor: true }, `${book.wins}W/${book.losses}L`),
     ),
     h(
       Box,
@@ -859,81 +1200,52 @@ function PositionsView({ data, rows, width, selected, showDetail, canType, nowMs
       h(Text, { dimColor: true }, `cash ${money(book.cashUsd)}`),
       width > 74 && h(Text, { dimColor: true }, `costs ${money(book.costsPaidUsd)}`),
     ),
-    h(
-      Text,
-      { dimColor: true },
-      `${book.wins}W / ${book.losses}L · ${book.openedCount} opened · ${book.closedCount} closed` +
-        (book.consecutiveLosses > 0
-          ? ` · ${book.consecutiveLosses} loss${book.consecutiveLosses === 1 ? '' : 'es'} in a row`
-          : ''),
-    ),
     h(Text, null, ''),
-    h(Text, { bold: true }, openRows === 0 ? 'NO OPEN POSITIONS' : 'OPEN POSITIONS'),
-    ...book.positions.map((p) =>
-      h(
-        Box,
-        { key: p.mint },
-        h(Cell, { w: 12, bold: true }, (p.symbol ?? p.mint.slice(0, 8)).slice(0, 10)),
-        h(Cell, { w: 8, dimColor: true }, money(p.sizeUsd)),
-        width > 48 && h(Cell, { w: 15, dimColor: true }, `in ${price(p.entryPriceUsd)}`),
-        width > 64 && h(Cell, { w: 16, dimColor: true }, `now ${price(p.lastPriceUsd)}`),
-        h(
-          Cell,
-          { w: 10, color: (p.unrealisedPnlUsd ?? 0) >= 0 ? 'green' : 'red', bold: true },
-          money(p.unrealisedPnlUsd, true),
-        ),
-        // How old this mark is, because a stale one is not a calm position -- it
-        // is an unmanaged one. With no current price the stop loss has nothing to
-        // compare against, so this number is a safety readout, not a detail.
-        width > 80 && h(MarkAge, { ts: p.lastMarkTs, now: nowMs }),
-      ),
-    ),
-    h(Text, null, ''),
-    trades.length === 0
-      ? h(Text, { dimColor: true }, 'No closed trades yet.')
+    list.length === 0
+      ? h(Text, { dimColor: true }, 'Flat — nothing open and nothing closed yet.')
       : h(
           Box,
           { flexDirection: 'column' },
-          h(
-            Box,
-            null,
-            h(Cell, { w: 2 }, ' '),
-            h(Head, { w: 12 }, 'CLOSED'),
-            h(Head, { w: 11 }, 'P&L'),
-            width > 54 && h(Head, { w: 22 }, 'WHY IT CLOSED'),
-            width > 78 && h(Head, { w: 10 }, 'AT'),
-          ),
-          ...visible.map((t, i) => {
+          ...list.slice(start, start + listRows).map((r, i) => {
             const isSel = start + i === selected;
+            const open = r.kind === 'open';
+            const value = open ? r.pos.unrealisedPnlUsd : r.trade.netPnlUsd;
             return h(
               Box,
-              { key: `${t.mint}:${t.closedTs ?? t.ts}:${start + i}` },
-              h(Cell, { w: 2, color: 'cyan', bold: true }, isSel ? '\u25b6' : ' '),
+              { key: `${r.kind}:${r.mint}:${start + i}` },
+              h(Cell, { w: 2, color: 'cyan', bold: true }, isSel ? '▶' : ' '),
+              h(
+                Cell,
+                { w: 7, color: open ? 'cyan' : 'gray', bold: open },
+                open ? 'OPEN' : 'closed',
+              ),
               h(
                 Cell,
                 { w: 12, bold: true, inverse: isSel },
-                (t.symbol ?? t.mint.slice(0, 8)).slice(0, 10),
+                (r.symbol ?? r.mint.slice(0, 8)).slice(0, 10),
               ),
               h(
                 Cell,
-                {
-                  w: 11,
-                  color: (t.netPnlUsd ?? 0) >= 0 ? 'green' : 'red',
-                  bold: true,
-                  inverse: isSel,
-                },
-                money(t.netPnlUsd, true),
+                { w: 11, color: (value ?? 0) >= 0 ? 'green' : 'red', bold: true, inverse: isSel },
+                money(value, true),
               ),
-              width > 54 && h(Cell, { w: 22, dimColor: true, inverse: isSel }, t.reason ?? '—'),
-              width > 78 &&
-                h(Cell, { w: 10, dimColor: true, inverse: isSel }, clock(t.closedTs ?? t.ts)),
+              width > 56 &&
+                h(
+                  Cell,
+                  { w: 22, dimColor: true, inverse: isSel },
+                  open ? `in ${price(r.pos.entryPriceUsd)}` : (r.trade.reason ?? ''),
+                ),
+              width > 80 &&
+                (open
+                  ? h(MarkAge, { ts: r.pos.lastMarkTs, now: nowMs })
+                  : h(Cell, { w: 14, dimColor: true }, clock(r.trade.closedTs ?? r.trade.ts))),
             );
           }),
           h(
             Text,
             { dimColor: true },
-            `${selected + 1} of ${trades.length} closed` +
-              (canType ? ' · up/down move · enter or space for the address' : ''),
+            `${selected + 1} of ${list.length}` +
+              (canType ? ' · up/down move · enter for the chart · t timeframe' : ''),
           ),
         ),
     detail !== null && h(Text, null, ''),
@@ -947,37 +1259,16 @@ function PositionsView({ data, rows, width, selected, showDetail, canType, nowMs
           paddingX: 1,
           width: Math.max(40, width - 2),
         },
-        h(
-          Box,
-          { gap: 2 },
-          h(Text, { bold: true, color: 'cyan' }, detail.symbol ?? '?'),
-          h(
-            Text,
-            { color: (detail.netPnlUsd ?? 0) >= 0 ? 'green' : 'red', bold: true },
-            `${money(detail.netPnlUsd, true)}  ${pct(detail.netPnlPct)}`,
-          ),
-          h(Text, { dimColor: true }, detail.reason ?? ''),
-        ),
-        h(Text, { wrap: 'wrap' }, detail.mint),
-        h(Text, null, ''),
-        h(Field, { label: 'size' }, money(detail.sizeUsd)),
-        h(Field, { label: 'in then out' }, `${price(detail.entryPriceUsd)}  to  ${price(detail.exitPriceUsd)}`),
-        // Gross beside net, so the cost of trading is visible rather than folded
-        // into one number. On a $40 position the two legs are most of the answer.
-        h(
-          Field,
-          { label: 'gross then net' },
-          `${money(detail.grossPnlUsd, true)}  minus ${money(detail.totalCostUsd)} costs  =  ` +
-            `${money(detail.netPnlUsd, true)}`,
-        ),
-        h(
-          Field,
-          { label: 'held' },
-          `${clock(detail.openedTs)} to ${clock(detail.closedTs)}` +
-            (Number.isFinite(detail.holdMs) ? `   (${Math.round(detail.holdMs / 60000)} min)` : ''),
-        ),
-        h(Text, null, ''),
-        h(Links, { mint: detail.mint }),
+        detail.kind === 'open'
+          ? h(OpenDetail, {
+              row: detail,
+              series,
+              window: win,
+              nowMs,
+              config: data.config,
+              width: width - 6,
+            })
+          : h(ClosedDetail, { row: detail, series, window: win, nowMs, width: width - 6 }),
       ),
   );
 }
@@ -1080,7 +1371,7 @@ const EvidenceViewMemo = memo(EvidenceView);
 
 /* ---------------------------------------------------------------------- app */
 
-export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail = false }) {
+export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail = false, initialWindow = WINDOWS[1].key }) {
   const { exit } = useApp();
   // Ink THROWS from useInput when the terminal has no raw mode -- which is the
   // likely cause of 'the keys do nothing': not a bug in the handler, but a
@@ -1102,6 +1393,15 @@ export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail 
   // -- row 40 of a 90-token history is meaningless in a 3-row candidate list.
   const [cursor, setCursor] = useState(Object.freeze({ live: 0, positions: 0, history: 0 }));
   const [showDetail, setShowDetail] = useState(openDetail);
+  const [group, setGroup] = useState('all');
+  const [query, setQuery] = useState('');
+  const [searching, setSearching] = useState(false);
+  const [win, setWin] = useState(initialWindow);
+  // Short-lived acknowledgement for 'r'. Reloading found nothing new most of the
+  // time -- correctly, since the recorder writes once a minute -- so the key
+  // looked broken. It was not: verified reads 1 -> 2 with a synthetic terminal.
+  // What was missing was any sign it had happened.
+  const [flash, setFlash] = useState(null);
   // What the last accepted payload looked like. A ref, not state: changing it
   // must not itself cause a render.
   const sigRef = useRef('');
@@ -1159,6 +1459,12 @@ export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail 
     };
   }, [dir, journalDir, refreshMs, nudge]);
 
+  useEffect(() => {
+    if (flash === null) return undefined;
+    const t = setTimeout(() => setFlash(null), 1_800);
+    return () => clearTimeout(t);
+  }, [flash]);
+
   // The animation clock, separate from the read clock. It advances the scan feed
   // and re-derives the snapshot age, so the countdown moves every second instead
   // of jumping in whole refresh intervals.
@@ -1171,11 +1477,16 @@ export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail 
   // waiting on anything.
   // The list the cursor is currently walking. Both views are selectable; the
   // evidence view has no rows, so the arrows fall through to nothing there.
+  // Filtered HERE, so the cursor is clamped against the same list the view
+  // draws. Computing it twice is how a detail panel ends up showing a different
+  // row from the highlighted one.
+  const visibleRows =
+    view === 'history' ? filterHistory(data.history, group, query, data.config) : [];
   const listLength =
     view === 'history'
-      ? data.history.length
+      ? visibleRows.length
       : view === 'positions'
-        ? data.paper.trades.length
+        ? positionRows(data.paper.book, data.paper.trades).length
         : data.lastScan.length;
   const selected = Math.min(cursor[view] ?? 0, Math.max(0, listLength - 1));
 
@@ -1188,17 +1499,52 @@ export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail 
       const move = (delta) =>
         setCursor((c) => ({ ...c, [view]: Math.max(0, Math.min(last, (c[view] ?? 0) + delta)) }));
 
+      // SEARCH MODE SWALLOWS EVERYTHING. Otherwise typing a token name would
+      // quit on the 'q' and change view on any digit -- the classic way a search
+      // box in a key-driven interface becomes unusable.
+      if (searching) {
+        if (key.escape) {
+          setSearching(false);
+          setQuery('');
+        } else if (key.return) {
+          setSearching(false);
+        } else if (key.backspace || key.delete) {
+          setQuery((t) => t.slice(0, -1));
+        } else if (input !== undefined && input.length === 1 && input >= ' ') {
+          setQuery((t) => (t + input).slice(0, 24));
+        }
+        return;
+      }
+
       if (input === 'q' || (key.ctrl && input === 'c')) exit();
       else if (key.escape) {
         // Escape backs out of the panel first. Quitting the whole dashboard
         // because someone wanted to close a detail view would be hostile.
         if (showDetail) setShowDetail(false);
+        else if (query !== '') setQuery('');
         else exit();
       } else if (input === '1') setView(VIEWS[0]);
       else if (input === '2') setView(VIEWS[1]);
       else if (input === '3') setView(VIEWS[2]);
       else if (input === '4') setView(VIEWS[3]);
-      else if (input === 'r') setNudge((n) => n + 1);
+      else if (input === 'r') {
+        setNudge((n) => n + 1);
+        // Capture what the screen was showing BEFORE the re-read, so the
+        // acknowledgement can say whether anything actually arrived. Without a
+        // baseline the message can only assert, and asserting "nothing new"
+        // unconditionally is worse than staying quiet.
+        setFlash({ was: data.generatedAt });
+      } else if (input === '/') {
+        setSearching(true);
+        setView('history');
+      } else if (input === 'g') {
+        const i = GROUPS.findIndex((x) => x.key === group);
+        setGroup(GROUPS[(i + 1) % GROUPS.length].key);
+        setView('history');
+      } else if (input === 't') {
+        const i = WINDOWS.findIndex((x) => x.key === win);
+        setWin(WINDOWS[(i + 1) % WINDOWS.length].key);
+      }
       else if (key.upArrow) move(-1);
       else if (key.downArrow) move(1);
       else if (key.pageUp) move(-10);
@@ -1264,7 +1610,16 @@ export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail 
       h(Text, { bold: true }, 'SOLSCALP'),
       h(Text, { color: data.recorder.healthy ? 'cyan' : 'red', bold: true }, spin),
       status,
-      heapMb >= HEAP_WARN_MB
+      flash !== null
+        ? h(
+            Text,
+            { color: 'cyan', bold: true },
+            // The payload is only replaced when the recording moved, so an equal
+            // generatedAt genuinely means nothing changed -- which is the normal
+            // answer, since the recorder writes once a minute.
+            data.generatedAt === flash.was ? 're-read · nothing new' : 're-read · updated',
+          )
+        : heapMb >= HEAP_WARN_MB
         ? h(
             Text,
             { color: heapMb >= HEAP_URGENT_MB ? 'red' : 'yellow', bold: true },
@@ -1277,6 +1632,11 @@ export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail 
       data,
       view,
       error,
+      group,
+      query,
+      searching,
+      window: win,
+      visibleRows,
       // Coarse on purpose. The mark age only needs to be roughly right, and a
       // per-second value here would re-render the whole body every second and
       // undo the memoisation that stopped this process leaking.
@@ -1313,6 +1673,11 @@ const Body = memo(function Body({
   termCols,
   rows,
   nowMs,
+  group,
+  query,
+  searching,
+  window: win,
+  visibleRows,
 }) {
   return h(
     Box,
@@ -1333,7 +1698,11 @@ const Body = memo(function Body({
         ),
       ),
       canType
-        ? h(Text, { dimColor: true }, '· arrows move · enter details · r reload · q quit')
+        ? h(
+            Text,
+            { dimColor: true },
+            '· arrows · enter details · / search · g group · t timeframe · r reload · q quit',
+          )
         : h(Text, { color: 'yellow' }, '· no keys here: use --view'),
     ),
     h(
@@ -1356,9 +1725,9 @@ const Body = memo(function Body({
       error !== null
         ? h(Text, { color: 'red', wrap: 'wrap' }, `read failed: ${error}`)
         : view === 'positions'
-          ? h(PositionsViewMemo, { data, rows, width: inner, selected, showDetail, canType, nowMs })
+          ? h(PositionsViewMemo, { data, rows, width: inner, selected, showDetail, canType, nowMs, window: win })
           : view === 'history'
-            ? h(HistoryViewMemo, { data, rows, width: inner, selected, showDetail, canType })
+            ? h(HistoryViewMemo, { data, visibleRows, rows, width: inner, selected, showDetail, canType, group, query, searching })
             : view === 'evidence'
               ? h(EvidenceViewMemo, { data })
               : h(LiveViewMemo, { data, rows, width: inner, pageTick, selected, showDetail, canType }),
@@ -1397,12 +1766,13 @@ export async function main(argv, deps = {}) {
   const initialView = VIEWS.includes(flags.view) ? flags.view : VIEWS[0];
   const cols = flags.cols === undefined ? undefined : intFlag(flags.cols, 100);
   const openDetail = flags.detail === true;
+  const initialWindow = WINDOWS.some((w) => w.key === flags.window) ? flags.window : WINDOWS[1].key;
 
   // --once renders a single frame and exits: the only way this screen is
   // testable, and useful for a quick look without taking over the terminal.
   if (flags.once === true) {
     const app = render(
-      h(Box, { flexDirection: 'column' }, h(App, { dir, journalDir, refreshMs: 1e9, initialView, cols, openDetail })),
+      h(Box, { flexDirection: 'column' }, h(App, { dir, journalDir, refreshMs: 1e9, initialView, cols, openDetail, initialWindow })),
       { patchConsole: false },
     );
     await new Promise((r) => setTimeout(r, 400));
@@ -1410,7 +1780,7 @@ export async function main(argv, deps = {}) {
     return EXIT.OK;
   }
 
-  const app = render(h(App, { dir, journalDir, refreshMs, initialView, cols, openDetail }));
+  const app = render(h(App, { dir, journalDir, refreshMs, initialView, cols, openDetail, initialWindow }));
   await app.waitUntilExit();
   return EXIT.OK;
 }

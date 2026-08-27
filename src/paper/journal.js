@@ -35,6 +35,16 @@ import { JOURNAL } from '../config.js';
 /** Closed trades kept inside a book snapshot. The `trade` lines hold the rest. */
 export const BOOK_TRADE_TAIL = 20;
 
+/**
+ * Price points kept per mint when folding the journal.
+ *
+ * The journal is append-only and grows forever, but a chart a few dozen columns
+ * wide cannot use more than this, and the dashboard re-reads the whole file every
+ * few seconds. Bounded here rather than at the drawing site so the cost never
+ * reaches the renderer.
+ */
+export const SERIES_CAP = 240;
+
 const ISO_DATE_LENGTH = 10;
 
 /** UTC day bucket, so a file boundary is the same wherever the bot runs. */
@@ -166,6 +176,7 @@ export async function appendJournal(records, { dir = JOURNAL.dir } = {}, deps = 
 export function readJournal(lines) {
   let book = null;
   const trades = [];
+  const series = new Map();
   let malformed = 0;
 
   for (const line of lines) {
@@ -182,6 +193,22 @@ export function readJournal(lines) {
     if (record.type === 'book') {
       // Latest wins, and ties resolve to the later line, which is the later write.
       if (book === null || record.ts >= book.ts) book = record;
+      // Every book line is also one observation of every position it held, which
+      // is where a price history comes from without storing one separately. The
+      // bot publishes when a mark moves, so this is roughly one point per cycle
+      // for as long as a position was open.
+      for (const pos of Array.isArray(record.positions) ? record.positions : []) {
+        if (typeof pos?.mint !== 'string' || !Number.isFinite(pos.lastPriceUsd)) continue;
+        const points = series.get(pos.mint) ?? [];
+        points.push(
+          Object.freeze({
+            ts: pos.lastMarkTs ?? record.ts,
+            priceUsd: pos.lastPriceUsd,
+            pnlUsd: Number.isFinite(pos.unrealisedPnlUsd) ? pos.unrealisedPnlUsd : null,
+          }),
+        );
+        series.set(pos.mint, points);
+      }
     } else if (record.type === 'trade') {
       trades.push(record);
     }
@@ -189,9 +216,20 @@ export function readJournal(lines) {
 
   trades.sort((a, b) => (a.closedTs ?? a.ts) - (b.closedTs ?? b.ts));
 
+  // Sorted and de-duplicated by timestamp: the bot republishes the whole book on
+  // every change, so the same mark can appear on several consecutive lines and
+  // would otherwise draw as a flat run that never happened.
+  const cleaned = new Map();
+  for (const [mint, points] of series) {
+    const seen = new Map();
+    for (const pt of points.sort((x, y) => x.ts - y.ts)) seen.set(pt.ts, pt);
+    cleaned.set(mint, Object.freeze([...seen.values()].slice(-SERIES_CAP)));
+  }
+
   return Object.freeze({
     book,
     trades: Object.freeze(trades),
+    series: cleaned,
     malformed,
     // Present but empty is a different state from absent, and the UI must be able
     // to tell "the bot is running and flat" from "the bot has never run".

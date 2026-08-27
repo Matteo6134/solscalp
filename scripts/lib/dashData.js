@@ -184,6 +184,9 @@ export async function buildDashData({ dir = RECORDER.dir, journalDir = JOURNAL.d
       hasBook: journal.hasBook,
       book: journal.book,
       trades: journal.trades,
+      // A Map would work, but the payload is frozen and compared by identity in
+      // the UI; a plain object keeps it consistent with everything else here.
+      series: Object.freeze(Object.fromEntries(journal.series)),
     }),
     evidence: Object.freeze({
       tally,
@@ -197,6 +200,11 @@ export async function buildDashData({ dir = RECORDER.dir, journalDir = JOURNAL.d
       minMarketCapUsd: STRATEGY.universe.minMarketCapUsd,
       maxMarketCapUsd: STRATEGY.universe.maxMarketCapUsd,
       recentWindowTicks: RECENT_WINDOW_TICKS,
+      stopLossPct: STRATEGY.exit.stopLossPct,
+      takeProfitPct: STRATEGY.exit.takeProfitPct,
+      trailingStopPct: STRATEGY.exit.trailingStopPct,
+      trailingArmsAtPct: STRATEGY.exit.trailingArmsAtPct,
+      timeStopMinutes: STRATEGY.exit.timeStopMinutes,
       autoLabelEveryMinutes: LABELS.autoLabelEveryMinutes,
       minAgeHoursBeforeLabelling: LABELS.minAgeHoursBeforeLabelling,
       RUGGED: LABEL.RUGGED,
@@ -220,7 +228,12 @@ export const EMPTY = Object.freeze({
   scanned: Object.freeze([]),
   lastScan: Object.freeze([]),
   history: Object.freeze([]),
-  paper: Object.freeze({ hasBook: false, book: null, trades: Object.freeze([]) }),
+  paper: Object.freeze({
+    hasBook: false,
+    book: null,
+    trades: Object.freeze([]),
+    series: Object.freeze({}),
+  }),
   evidence: Object.freeze({
     tally: Object.freeze({
       snapshots: 0, uniqueMints: 0, approved: 0, rugged: 0, unlabelled: 0,
@@ -236,6 +249,11 @@ export const EMPTY = Object.freeze({
     minMarketCapUsd: STRATEGY.universe.minMarketCapUsd,
     maxMarketCapUsd: STRATEGY.universe.maxMarketCapUsd,
     recentWindowTicks: RECENT_WINDOW_TICKS,
+    stopLossPct: STRATEGY.exit.stopLossPct,
+    takeProfitPct: STRATEGY.exit.takeProfitPct,
+    trailingStopPct: STRATEGY.exit.trailingStopPct,
+    trailingArmsAtPct: STRATEGY.exit.trailingArmsAtPct,
+    timeStopMinutes: STRATEGY.exit.timeStopMinutes,
     autoLabelEveryMinutes: LABELS.autoLabelEveryMinutes,
     minAgeHoursBeforeLabelling: LABELS.minAgeHoursBeforeLabelling,
     RUGGED: LABEL.RUGGED,

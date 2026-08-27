@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { RECORDER } from '../../src/config.js';
 import { EMPTY, buildDashData } from '../../scripts/lib/dashData.js';
-import { fitColumns } from '../../scripts/dash.js';
+import { filterHistory, fitColumns, groupCounts, positionRows } from '../../scripts/dash.js';
 
 const TS = 1_756_000_000_000;
 const MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
@@ -164,5 +164,81 @@ describe('buildDashData', () => {
     expect(EMPTY.recorder.healthy).toBe(false);
     expect(EMPTY.recorder.snapshotAgeMs).toBeNull();
     expect(EMPTY.evidence.report.sufficient).toBe(false);
+  });
+});
+
+describe('filterHistory and groupCounts', () => {
+  const cfg = { RUGGED: 'rugged', SURVIVED: 'survived' };
+  const rows = [
+    { symbol: 'PHASEONE', mint: 'aaa111', label: 'rugged', gateBuyable: false },
+    { symbol: 'HAILEY', mint: 'bbb222', label: 'survived', gateBuyable: true },
+    { symbol: 'cat', mint: 'ccc333', label: null, gateBuyable: true },
+    { symbol: null, mint: 'ddd444', label: null, gateBuyable: false },
+  ];
+
+  it('every group narrows the same list', () => {
+    expect(filterHistory(rows, 'all', '', cfg)).toHaveLength(4);
+    expect(filterHistory(rows, 'rugged', '', cfg).map((r) => r.symbol)).toEqual(['PHASEONE']);
+    expect(filterHistory(rows, 'survived', '', cfg).map((r) => r.symbol)).toEqual(['HAILEY']);
+    expect(filterHistory(rows, 'safe', '', cfg).map((r) => r.symbol)).toEqual(['HAILEY', 'cat']);
+  });
+
+  it('unlabelled is anything not yet decided, not a third label', () => {
+    // UNKNOWN is the default and must never be counted as survived.
+    expect(filterHistory(rows, 'open', '', cfg).map((r) => r.mint)).toEqual(['ccc333', 'ddd444']);
+  });
+
+  it('search matches the symbol or the mint, case-insensitively', () => {
+    expect(filterHistory(rows, 'all', 'hail', cfg).map((r) => r.mint)).toEqual(['bbb222']);
+    expect(filterHistory(rows, 'all', 'CCC', cfg).map((r) => r.mint)).toEqual(['ccc333']);
+    expect(filterHistory(rows, 'all', 'nothing', cfg)).toEqual([]);
+  });
+
+  it('a row with no symbol is searchable by mint and never throws', () => {
+    expect(filterHistory(rows, 'all', 'ddd', cfg).map((r) => r.mint)).toEqual(['ddd444']);
+  });
+
+  it('search and group compose', () => {
+    expect(filterHistory(rows, 'safe', 'cat', cfg).map((r) => r.mint)).toEqual(['ccc333']);
+    expect(filterHistory(rows, 'rugged', 'cat', cfg)).toEqual([]);
+  });
+
+  it('an unknown group falls back to ALL rather than showing nothing', () => {
+    expect(filterHistory(rows, 'not-a-group', '', cfg)).toHaveLength(4);
+  });
+
+  it('counts cover every row exactly once per group definition', () => {
+    const counts = groupCounts(rows, cfg);
+    const by = Object.fromEntries(counts.map((c) => [c.key, c.n]));
+    expect(by.all).toBe(4);
+    expect(by.rugged + by.survived + by.open).toBe(4);
+  });
+});
+
+describe('positionRows', () => {
+  const book = {
+    positions: [{ mint: 'open1', symbol: 'A' }],
+    realisedPnlUsd: 0,
+  };
+  const trades = [
+    { mint: 'old', symbol: 'OLD', closedTs: 1 },
+    { mint: 'new', symbol: 'NEW', closedTs: 2 },
+  ];
+
+  it('open positions come first, then closed newest-first', () => {
+    const rows = positionRows(book, trades);
+    expect(rows.map((r) => r.kind)).toEqual(['open', 'closed', 'closed']);
+    // The last thing that happened is the thing being asked about.
+    expect(rows.map((r) => r.symbol)).toEqual(['A', 'NEW', 'OLD']);
+  });
+
+  it('no book is an empty list, not a crash', () => {
+    expect(positionRows(null, trades)).toEqual([]);
+  });
+
+  it('does not mutate the trades it was given', () => {
+    const original = [...trades];
+    positionRows(book, trades);
+    expect(trades).toEqual(original);
   });
 });
