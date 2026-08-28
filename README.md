@@ -118,11 +118,23 @@ Switch effortlessly between simulation and real on-chain trading:
 
 ---
 
+## ⚡ RPC Infrastructure: Helius Mainnet
+
+SOLSCALP is built and optimized for **[Helius](https://helius.dev)** as its primary Solana RPC provider:
+
+* **Why Helius:** Public Solana RPC nodes aggressively rate-limit `getTokenLargestAccounts` and Token-2022 extension lookups, causing fail-closed safety checks to reject valid tokens. Helius provides high-throughput, low-latency infrastructure purpose-built for Solana DEX trading.
+* **Cost-Effective Architecture:** Operates with peak performance on Helius's free/developer tier (1,000,000 free monthly credits) — **no $500/mo enterprise add-ons required**.
+* **Dual Streaming Engine:**
+  1. **High-Speed HTTP/WSS Radar (Default & Recommended):** Scans trending DEX pairs and runs the 6-layer safety gate every 1–2 seconds.
+  2. **Yellowstone Geyser gRPC (Optional):** Plug-and-play support for Helius LaserStream / Triton gRPC validator streams for sub-millisecond block interception.
+
+---
+
 ## 🚀 Quick Start
 
 ### 1. Prerequisites
 * **Node.js**: v20.0.0 or higher.
-* **Solana RPC**: A high-speed RPC endpoint (e.g. [Helius](https://helius.dev), QuickNode, or Alchemy).
+* **Helius API Key**: Create a free account at [helius.dev](https://helius.dev) to get your dedicated RPC endpoint.
 
 ### 2. Installation & Test Suite
 ```bash
@@ -143,12 +155,17 @@ Create your `.env` file from the provided example:
 cp .env.example .env
 ```
 
-Edit `.env` with your settings:
+Configure your `.env` with your Helius endpoint:
 ```env
-# Dedicated RPC Endpoint (Required for high-speed holder queries)
-SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY
+# Primary High-Speed RPC Endpoint (Helius)
+SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY
+SOLANA_RPC_URL_FALLBACK=https://api.mainnet-beta.solana.com
 
-# Telegram Alerts (Optional)
+# Yellowstone Geyser gRPC (Optional for institutional sub-millisecond streaming)
+SOLANA_GRPC_URL=https://grpc.helius-rpc.com
+SOLANA_GRPC_TOKEN=YOUR_HELIUS_API_KEY
+
+# Telegram Alerts & Remote Control (Optional)
 TELEGRAM_BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ
 TELEGRAM_CHAT_ID=987654321
 
