@@ -201,7 +201,8 @@ function normaliseQuote(body, expected) {
 }
 
 const QUOTE_CACHE = new Map();
-const QUOTE_CACHE_TTL_MS = 25_000;
+/** Micro-cache TTL: 3.5s to debounce identical scans in the same tick without delaying price moves */
+const QUOTE_CACHE_TTL_MS = 3_500;
 
 /**
  * GET /quote. Quoting only -- no transaction is ever built or signed.
@@ -211,13 +212,14 @@ const QUOTE_CACHE_TTL_MS = 25_000;
  * @param {string} p.outputMint
  * @param {string|number|bigint} p.amount amount of inputMint in its smallest unit
  * @param {number} p.slippageBps
+ * @param {boolean} [p.skipCache=false] force live fresh quote for actual trade execution
  * @param {{ httpRequest?: typeof request }} [deps] injection seam for tests
  * @returns {Promise<Readonly<{ inputMint: string, outputMint: string, inAmount: string,
  *   outAmount: string, otherAmountThreshold: string, priceImpactPct: number,
  *   routePlan: readonly object[], raw: object }>>}
  * @throws on no route (err.code === NO_ROUTE), HTTP failure, or unexpected shape
  */
-export async function getQuote({ inputMint, outputMint, amount, slippageBps }, deps = {}) {
+export async function getQuote({ inputMint, outputMint, amount, slippageBps, skipCache = false }, deps = {}) {
   const httpRequest = deps.httpRequest ?? request;
   if (!isNonEmptyString(inputMint)) {
     throw new TypeError(`getQuote: inputMint must be a mint address, got ${describe(inputMint)}`);
@@ -235,7 +237,7 @@ export async function getQuote({ inputMint, outputMint, amount, slippageBps }, d
   const cacheKey = `${inputMint}:${outputMint}:${amountStr}:${slippageBps}`;
   const now = Date.now();
   const cached = QUOTE_CACHE.get(cacheKey);
-  if (cached && now - cached.ts < QUOTE_CACHE_TTL_MS && !deps.httpRequest) {
+  if (!skipCache && cached && now - cached.ts < QUOTE_CACHE_TTL_MS && !deps.httpRequest) {
     return cached.quote;
   }
 
