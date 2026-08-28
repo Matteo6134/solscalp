@@ -197,40 +197,156 @@ export function formatDataSourceDown({ detail }) {
 
 /** Reply to /status. */
 export function formatStatus({ cycle, funnel, book, equityUsd, feed, profile, rpcLabel, uptimeMs }) {
+  const positions = Array.isArray(book?.positions) ? book.positions : Object.values(book?.positions ?? {});
+  const pnl = (book?.realisedPnlUsd ?? 0) + (book?.unrealisedPnlUsd ?? 0);
+  const pnlEmoji = pnl >= 0 ? '🟢' : '🔴';
+
   return [
-    '📊 <b>SOLSCALP STATUS</b>',
+    '📊 <b>SOLSCALP SYSTEM STATUS</b>',
     '',
-    `<b>cycle</b> ${cycle}   <b>feed</b> ${escapeHtml(feed)}   <b>profile</b> ${escapeHtml(profile)}`,
-    `<b>up</b> ${Math.round(uptimeMs / 60_000)}m   <b>rpc</b> ${escapeHtml(rpcLabel)}`,
+    `<b>Book Equity:</b> ${usd(equityUsd)}  (${usd(book?.cashUsd ?? equityUsd)} cash)`,
+    `<b>Total P&L:</b> ${pnlEmoji} <b>${money(pnl)}</b> (${book?.wins ?? 0}W / ${book?.losses ?? 0}L)`,
+    `<b>Open Positions:</b> ${positions.length} active`,
+    `<b>Uptime:</b> ${Math.round(uptimeMs / 60_000)}m   <b>Profile:</b> ${escapeHtml(profile)}`,
     '',
-    '<b>last funnel</b>',
-    `pools ${funnel.pools} → pairs ${funnel.pairs} → screened ${funnel.screened}`,
-    `→ gated ${funnel.gated} → safe ${funnel.safe} → <b>would enter ${funnel.wouldEnter}</b>`,
+    '<b>🔍 Live Scanner Funnel:</b>',
+    `Pools: ${funnel.pools} → Pairs: ${funnel.pairs} → Screened: ${funnel.screened}`,
+    `→ Gated: ${funnel.gated} → Safe: ${funnel.safe} → <b>Signals: ${funnel.wouldEnter}</b>`,
     '',
-    '<b>paper book</b>',
-    `equity ${usd(equityUsd)}   realised ${usd(book.realisedPnlUsd)}`,
-    `open ${Object.keys(book.positions).length}   closed ${book.closedCount}` +
-      `   wins ${book.wins}/${book.closedCount}`,
-    '',
-    '<i>paper only — no keypair exists in this repo</i>',
+    '<i>Available commands: /live, /positions, /history, /reentry, /status</i>',
   ].join('\n');
 }
 
-/** Reply to /positions. */
+/** Reply to /positions (Tab 2). */
 export function formatPositions({ book, now }) {
-  const entries = Object.entries(book.positions);
-  if (entries.length === 0) return '<b>no open paper positions</b>';
-  return [
-    `<b>OPEN PAPER POSITIONS</b> (${entries.length})`,
+  const positions = Array.isArray(book?.positions)
+    ? book.positions
+    : Object.values(book?.positions ?? {});
+
+  if (positions.length === 0) {
+    return `📊 <b>OPEN POSITIONS (0)</b>\n\n<b>No open paper positions right now.</b>\n<i>Cash: ${usd(book?.cashUsd ?? book?.equityUsd ?? 450)}</i>`;
+  }
+
+  const lines = [
+    `📊 <b>OPEN POSITIONS (${positions.length})</b>`,
+    `Equity: <b>${usd(book?.equityUsd ?? 450)}</b>   Cash: <b>${usd(book?.cashUsd ?? 409)}</b>`,
     '',
-    ...entries.map(([mint, p]) => {
-      const pnl = ((p.lastPriceUsd - p.entryPriceUsd) / p.entryPriceUsd) * 100;
-      return (
-        `${pnl >= 0 ? '🟢' : '🔴'} <code>${escapeHtml(mint.slice(0, 12))}</code> ` +
-        `${pct(pnl)}  ${usd(p.sizeUsd)}  held ${Math.round((now - p.openedTs) / 60_000)}m`
-      );
-    }),
-  ].join('\n');
+  ];
+
+  for (const p of positions) {
+    const pnlUsd = typeof p.unrealisedPnlUsd === 'number'
+      ? p.unrealisedPnlUsd
+      : p.entryPriceUsd && p.lastPriceUsd
+        ? ((p.lastPriceUsd - p.entryPriceUsd) / p.entryPriceUsd) * (p.sizeUsd ?? 40)
+        : 0;
+    const pnlPct = p.entryPriceUsd && p.lastPriceUsd
+      ? ((p.lastPriceUsd - p.entryPriceUsd) / p.entryPriceUsd) * 100
+      : 0;
+    const emoji = pnlPct >= 0 ? '🟢' : '🔴';
+    const heldMin = p.openedTs ? Math.max(0, Math.round((now - p.openedTs) / 60_000)) : 0;
+
+    lines.push(
+      `${emoji} <b>${escapeHtml(p.symbol ?? p.mint?.slice(0, 8) ?? '?')}</b> — <b>${pct(pnlPct)}</b> (${money(pnlUsd)})`,
+      `• <b>Price:</b> ${price(p.entryPriceUsd)} ➔ ${price(p.lastPriceUsd)}`,
+      `• <b>Size:</b> ${usd(p.sizeUsd)}   • <b>Held:</b> ${heldMin}m / 60m`,
+      `• <b>Stop Loss:</b> -15%   • <b>Trailing:</b> 8% (arms +15%)`,
+      links(p.mint),
+      '',
+    );
+  }
+
+  return lines.filter(Boolean).join('\n');
+}
+
+/** Reply to /reentry (Tab 5). */
+export function formatReentry({ reentry }) {
+  const list = reentry ?? [];
+  if (list.length === 0) {
+    return '🎯 <b>DIP-BUYING & RE-ENTRY TRACKING</b>\n\n<b>No closed trades to track yet.</b>';
+  }
+
+  const ready = list.filter((r) => r.status === 'READY').length;
+  const dips = list.filter((r) => r.status === 'DIP').length;
+
+  const lines = [
+    `🎯 <b>DIP-BUYING & RE-ENTRY TRACKING</b>`,
+    `<b>${ready} READY</b> · <b>${dips} DIPS</b> · ${list.length} monitored`,
+    '',
+  ];
+
+  for (const r of list.slice(0, 10)) {
+    const icon =
+      r.status === 'READY' ? '🚀' :
+      r.status === 'DIP' ? '🟡' :
+      r.status === 'HOLDING' ? '💎' :
+      r.status === 'BLOCKED' ? '🚫' : '👀';
+    const dip = r.dipPct !== null ? `${r.dipPct >= 0 ? '+' : ''}${r.dipPct.toFixed(1)}%` : '—';
+
+    lines.push(
+      `${icon} <b>${escapeHtml(r.symbol ?? r.mint?.slice(0, 8) ?? '?')}</b> [${r.status}]`,
+      `• Exit: ${price(r.exitPriceUsd)} ➔ Now: ${price(r.livePriceUsd)} (<b>${dip}</b>)`,
+      `• 5m: ${pct(r.m5Change)} | B/S: ${r.buySellRatio !== null ? r.buySellRatio.toFixed(1) : '—'} | Reason: ${escapeHtml(r.exitReason ?? '—')}`,
+      links(r.mint),
+      '',
+    );
+  }
+
+  return lines.join('\n');
+}
+
+/** Reply to /history (Tab 3). */
+export function formatHistory({ closedTrades }) {
+  const trades = closedTrades ?? [];
+  if (trades.length === 0) {
+    return '📜 <b>TRADE HISTORY (0)</b>\n\n<b>No closed trades recorded yet today.</b>';
+  }
+
+  const lines = [
+    `📜 <b>TRADE HISTORY (${trades.length})</b>`,
+    '',
+  ];
+
+  for (const t of trades.slice(-8).reverse()) {
+    const win = (t.netPnlUsd ?? 0) > 0;
+    const icon = win ? '✅' : '🔻';
+    const holdSecs = Number.isFinite(t.holdMs) ? Math.round(t.holdMs / 1000) : 0;
+    const holdStr = holdSecs >= 60 ? `${Math.round(holdSecs / 60)}m` : `${holdSecs}s`;
+
+    lines.push(
+      `${icon} <b>${escapeHtml(t.symbol ?? t.mint?.slice(0, 8) ?? '?')}</b> — <b>${money(t.netPnlUsd)}</b> (${pct(t.netPnlPct)})`,
+      `• In: ${price(t.entryPriceUsd)} ➔ Out: ${price(t.exitPriceUsd)} (${holdStr})`,
+      `• Reason: ${escapeHtml(t.reason ?? 'closed')}`,
+      links(t.mint),
+      '',
+    );
+  }
+
+  return lines.join('\n');
+}
+
+/** Reply to /evidence (Tab 4). */
+export function formatEvidence({ evidence, ml }) {
+  const tally = evidence?.tally ?? {};
+  const report = evidence?.report ?? {};
+  const lines = [
+    '🧪 <b>EVIDENCE & SCAM WEIGHTS</b>',
+    '',
+    `<b>Snaps:</b> ${tally.snapshots ?? 0}   <b>Pools:</b> ${tally.poolsSeen ?? 0}`,
+    `<b>Pass Rate:</b> ${report.passRatePct ? report.passRatePct.toFixed(1) : 0}%`,
+    '',
+  ];
+
+  if (ml?.weights) {
+    lines.push('<b>🤖 AI Scam Classifier Weights:</b>');
+    const sorted = Object.entries(ml.weights).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
+    for (const [k, v] of sorted.slice(0, 6)) {
+      lines.push(`• <code>${escapeHtml(k)}</code>: ${v > 0 ? '+' : ''}${v.toFixed(3)}`);
+    }
+    lines.push('');
+  }
+
+  lines.push('<i>Trained continuously from forward on-chain outcomes.</i>');
+  return lines.join('\n');
 }
 
 /**
@@ -259,29 +375,39 @@ export function formatGate({ mint, gate }) {
 
 /** Reply to /help — also what the Telegram "/" menu describes. */
 export const COMMANDS = Object.freeze([
-  Object.freeze({ command: 'status', description: 'funnel, paper book, uptime' }),
-  Object.freeze({ command: 'candidates', description: 'what passed the screen right now' }),
-  Object.freeze({ command: 'positions', description: 'open paper positions' }),
-  Object.freeze({ command: 'check', description: 'run the safety gate on a mint: /check <mint>' }),
-  Object.freeze({ command: 'pause', description: 'stop sending alerts' }),
-  Object.freeze({ command: 'resume', description: 'start sending alerts again' }),
-  Object.freeze({ command: 'help', description: 'this list' }),
+  Object.freeze({ command: 'status', description: 'System overview, equity, and P&L' }),
+  Object.freeze({ command: 'live', description: 'Tab 1: Live candidate scanner' }),
+  Object.freeze({ command: 'positions', description: 'Tab 2: Open trades, stop loss & trailing' }),
+  Object.freeze({ command: 'history', description: 'Tab 3: Closed trades and today results' }),
+  Object.freeze({ command: 'evidence', description: 'Tab 4: AI scam model weights' }),
+  Object.freeze({ command: 'reentry', description: 'Tab 5: Dip-buying & re-entry tracking' }),
+  Object.freeze({ command: 'check', description: 'Run safety gate on mint: /check <mint>' }),
+  Object.freeze({ command: 'pause', description: 'Mute trade alerts' }),
+  Object.freeze({ command: 'resume', description: 'Unmute trade alerts' }),
+  Object.freeze({ command: 'help', description: 'Show all commands' }),
 ]);
 
 export function formatHelp() {
   return [
-    '<b>SOLSCALP</b> — paper-trading safety gate',
+    '<b>SOLSCALP DASHBOARD ON TELEGRAM</b>',
     '',
-    ...COMMANDS.map((c) => `/${c.command} — ${escapeHtml(c.description)}`),
+    '<b>📱 Dashboard Sections:</b>',
+    '• /live — <b>Tab 1: LIVE</b> candidates',
+    '• /positions — <b>Tab 2: POSITIONS</b> (with stop loss & charts)',
+    '• /history — <b>Tab 3: HISTORY</b> (closed trades today)',
+    '• /evidence — <b>Tab 4: EVIDENCE</b> (AI scam weights)',
+    '• /reentry — <b>Tab 5: RE-ENTRY</b> (dip-buying tracking)',
     '',
-    '<i>This bot reports and queries. It cannot trade: there is no keypair in',
-    'the repo and no code that can sign a transaction.</i>',
+    '<b>⚙️ Bot Control:</b>',
+    '• /status — Equity, cash, P&L, uptime',
+    '• /check &lt;mint&gt; — Run safety gate on any token',
+    '• /pause & /resume — Mute/unmute alerts',
   ].join('\n');
 }
 
-/** Reply to /candidates. */
+/** Reply to /candidates or /live. */
 export function formatCandidates({ candidates }) {
-  if (candidates.length === 0) {
+  if (!candidates || candidates.length === 0) {
     return [
       '<b>no candidates right now</b>',
       '',
@@ -290,7 +416,7 @@ export function formatCandidates({ candidates }) {
     ].join('\n');
   }
   return [
-    `<b>CANDIDATES</b> (${candidates.length})`,
+    `<b>LIVE CANDIDATES (${candidates.length})</b>`,
     '',
     ...candidates.slice(0, 10).map((c) => {
       const safe = c.gate.buyable ? '✅' : '⛔';

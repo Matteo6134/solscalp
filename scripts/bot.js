@@ -33,15 +33,19 @@ import {
   formatCandidates,
   formatClosed,
   formatDataSourceDown,
+  formatEvidence,
   formatGate,
   formatHelp,
+  formatHistory,
   formatKillSwitch,
   formatOpened,
   formatPositions,
   formatRecheckFailed,
+  formatReentry,
   formatSignal,
   formatStatus,
 } from '../src/notify/format.js';
+import { buildDashData } from './lib/dashData.js';
 import { isRecorderHealthy, latestSnapshot } from '../src/evidence/tail.js';
 import { createNotifier } from '../src/notify/telegram.js';
 import {
@@ -694,12 +698,26 @@ async function handleCommand(command, { state, notifier, deps, feed, universe, s
       );
     }
     case 'candidates':
+    case 'live':
       return reply(formatCandidates({ candidates: state.candidates }));
     case 'positions': {
       const paperDir2 = typeof deps.paperDir === 'string' ? deps.paperDir : JOURNAL.dir;
       const journal2 = await loadJournal({ dir: paperDir2 });
       const book2 = journal2.book ?? state.engine.portfolio;
       return reply(formatPositions({ book: book2, now: deps.now() }));
+    }
+    case 'history': {
+      const paperDir3 = typeof deps.paperDir === 'string' ? deps.paperDir : JOURNAL.dir;
+      const journal3 = await loadJournal({ dir: paperDir3 });
+      return reply(formatHistory({ closedTrades: journal3.trades ?? [] }));
+    }
+    case 'evidence': {
+      const data = await buildDashData({ now: deps.now() });
+      return reply(formatEvidence({ evidence: data.evidence, ml: data.ml }));
+    }
+    case 'reentry': {
+      const data = await buildDashData({ now: deps.now() });
+      return reply(formatReentry({ reentry: data.reentry }));
     }
     case 'check': {
       const mint = command.args[0];
