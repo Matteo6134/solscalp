@@ -200,6 +200,9 @@ function normaliseQuote(body, expected) {
   });
 }
 
+const QUOTE_CACHE = new Map();
+const QUOTE_CACHE_TTL_MS = 25_000;
+
 /**
  * GET /quote. Quoting only -- no transaction is ever built or signed.
  *
@@ -229,6 +232,12 @@ export async function getQuote({ inputMint, outputMint, amount, slippageBps }, d
     throw new TypeError(`getQuote: slippageBps must be a non-negative integer, got ${slippageBps}`);
   }
   const amountStr = toSmallestUnitString(amount, 'getQuote: amount');
+  const cacheKey = `${inputMint}:${outputMint}:${amountStr}:${slippageBps}`;
+  const now = Date.now();
+  const cached = QUOTE_CACHE.get(cacheKey);
+  if (cached && now - cached.ts < QUOTE_CACHE_TTL_MS && !deps.httpRequest) {
+    return cached.quote;
+  }
 
   const query = new URLSearchParams({
     inputMint,
@@ -243,20 +252,30 @@ export async function getQuote({ inputMint, outputMint, amount, slippageBps }, d
 
   let statusCode;
   let text;
-  try {
-    const res = await httpRequest(url, {
-      method: 'GET',
-      headers: { accept: 'application/json' },
-      headersTimeout: HTTP_TIMEOUT_MS,
-      bodyTimeout: HTTP_TIMEOUT_MS,
-    });
-    statusCode = res?.statusCode;
-    // Always drain the body: an undrained undici response leaks its socket.
-    text = await res?.body?.text();
-  } catch (err) {
-    throw new Error(`jupiter quote request failed for ${pair}: ${err?.message ?? String(err)}`, {
-      cause: err,
-    });
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await httpRequest(url, {
+        method: 'GET',
+        headers: { accept: 'application/json' },
+        headersTimeout: HTTP_TIMEOUT_MS,
+        bodyTimeout: HTTP_TIMEOUT_MS,
+      });
+      statusCode = res?.statusCode;
+      text = await res?.body?.text();
+      if (statusCode === 429 && attempt === 1) {
+        await delay(1_200);
+        continue;
+      }
+      break;
+    } catch (err) {
+      if (attempt === 1) {
+        await delay(800);
+        continue;
+      }
+      throw new Error(`jupiter quote request failed for ${pair}: ${err?.message ?? String(err)}`, {
+        cause: err,
+      });
+    }
   }
 
   if (typeof text !== 'string') {
@@ -285,7 +304,17 @@ export async function getQuote({ inputMint, outputMint, amount, slippageBps }, d
     throw new Error(`jupiter quote HTTP ${statusCode} for ${pair}: ${snippet(text)}`);
   }
 
-  return normaliseQuote(body, { inputMint, outputMint });
+  const normalized = normaliseQuote(body, { inputMint, outputMint });
+  if (!deps.httpRequest) {
+    QUOTE_CACHE.set(cacheKey, { ts: Date.now(), quote: normalized });
+    if (QUOTE_CACHE.size > 200) {
+      const pruneNow = Date.now();
+      for (const [k, v] of QUOTE_CACHE.entries()) {
+        if (pruneNow - v.ts > QUOTE_CACHE_TTL_MS) QUOTE_CACHE.delete(k);
+      }
+    }
+  }
+  return normalized;
 }
 
 /**

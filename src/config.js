@@ -151,15 +151,11 @@ export const ENDPOINTS = Object.freeze({
   dexscreener: 'https://api.dexscreener.com',
   geckoterminal: 'https://api.geckoterminal.com/api/v2',
   /**
-   * Jupiter's KEYLESS tier. The old `quote-api.jup.ag/v6` host no longer resolves
-   * at all (DNS ENOTFOUND), which made layer 1 -- the honeypot check, and the most
-   * important thing this project detects -- error on every single token. Under
-   * fail-closed that produced no false passes, but it did reject 100% of tokens,
-   * so the gate was silently useless rather than loudly broken. Verify this host
-   * still answers before trusting any pass rate.
-   * `api.jup.ag/swap/v1` is the paid tier and is deliberately not used here.
+   * Jupiter's High-Throughput Public tier.
+   * `https://public.jupiterapi.com` provides reliable quotes without the 429 throttling
+   * seen on the deprecated lite endpoint.
    */
-  jupiterQuote: 'https://lite-api.jup.ag/swap/v1',
+  jupiterQuote: 'https://public.jupiterapi.com',
   rugcheck: 'https://api.rugcheck.xyz/v1',
 });
 
