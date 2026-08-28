@@ -57,6 +57,7 @@ import {
   buildBookRecord,
   buildCandlesRecord,
   buildTradeRecord,
+  loadJournal,
 } from '../src/paper/journal.js';
 import { recheckGate, runGate } from '../src/safety/index.js';
 import { describeError } from '../src/rpc/rpc-errors.js';
@@ -292,9 +293,14 @@ export async function main(argv, injected = {}) {
         });
       }
     }
+    // When positions are open, check every 5s so a stop loss can actually fire
+    // before a meme coin crashes 50% between polls. When flat, use the normal
+    // interval to avoid burning API quota on empty scans.
+    const hasPositions = Object.keys(state.engine.portfolio.positions).length > 0;
+    const sleepMs = hasPositions ? 5 * MS_PER_SECOND : intervalMs;
     // Sleep in slices so Ctrl+C is responsive on a long interval.
-    for (let waited = 0; waited < intervalMs && running; waited += MS_PER_SECOND) {
-      await deps.sleep(Math.min(MS_PER_SECOND, intervalMs - waited));
+    for (let waited = 0; waited < sleepMs && running; waited += MS_PER_SECOND) {
+      await deps.sleep(Math.min(MS_PER_SECOND, sleepMs - waited));
     }
   }
 
@@ -372,7 +378,6 @@ export async function cycle({ state, notifier, deps, universe, paperEnabled, lim
       ),
     );
   }
-  const held = Object.keys(state.engine.portfolio.positions);
 
   // PRICE THE POSITIONS WE HOLD, EVEN WHEN THEY NO LONGER QUALIFY.
   //
@@ -392,19 +397,37 @@ export async function cycle({ state, notifier, deps, universe, paperEnabled, lim
   // most RISK.maxConcurrentPositions mints, batched into a single request, only
   // when one is actually missing. That is one request a minute against a limit
   // measured in tens, not the per-pool scanning that caused the original problem.
-  const unpriced = held.filter((m) => !pairs.some((p) => p.mint === m));
-  if (unpriced.length > 0) {
+  // ALWAYS fetch fresh prices for held positions directly from DexScreener.
+  // DexScreener allows 300 req/min, so we can safely hit this every 5 seconds
+  // while in a trade to get instant stop-loss reactions, completely bypassing
+  // the slow GeckoTerminal API limit.
+  const held = Object.keys(state.engine.portfolio.positions);
+  const recentClosed = (state.engine.portfolio.closedTrades ?? []).slice(-10).map((t) => t.mint);
+  const trackMints = [...new Set([...held, ...recentClosed])];
+
+  // ALWAYS fetch fresh prices for held positions AND recently closed tokens to monitor for dip-re-entries.
+  if (trackMints.length > 0) {
     try {
-      const extra = await deps.fetchPairs(unpriced);
-      pairs = [...pairs, ...[...extra.values()].filter((p) => p !== null)];
+      const extra = await deps.fetchPairs(trackMints);
+      const freshPairs = [...extra.values()].filter((p) => p !== null);
+      const freshMints = freshPairs.map((p) => p.mint);
+      // Remove stale versions and append fresh ones
+      pairs = pairs.filter((p) => !freshMints.includes(p.mint)).concat(freshPairs);
     } catch (err) {
-      // Leave them unmarked rather than guessing a price. The dashboard shows
-      // each mark's age, so an unpriceable position is visible rather than silent.
-      say(`[mark] could not price ${unpriced.length} held position(s): ${describeError(err)}`);
+      say(`[mark] could not price ${trackMints.length} tracked position(s): ${describeError(err)}`);
     }
   }
 
   const gateLimit = pLimit(GATE_CONCURRENCY);
+
+  // Ensure any tracked mint that does not have a gate result gets gated
+  for (const p of pairs) {
+    if (!gateResults[p.mint] && trackMints.includes(p.mint)) {
+      try {
+        gateResults[p.mint] = await deps.gate(p.mint, { rpc: deps.rpc });
+      } catch (e) {}
+    }
+  }
 
   const solPriceUsd = solPriceFrom(pairs);
   const costs = costsFor({ pairs: screened.map((r) => r.pair), gates: gateResults, solPriceUsd });
@@ -463,13 +486,16 @@ export async function cycle({ state, notifier, deps, universe, paperEnabled, lim
     const before = state.engine.portfolio;
     state.engine = stepEngine(state.engine, {
       ts: at,
-      pairs: screened.map((r) => r.pair).concat(pairs.filter((p) => held.includes(p.mint))),
+      pairs: screened.map((r) => r.pair).concat(pairs.filter((p) => trackMints.includes(p.mint))),
       gateResults,
       gateRechecks,
       costs,
       universe,
     });
-    await publishCandles({ state, held, poolOf, at, dir: paperDir, deps });
+    if (at - (state.lastCandlesAt ?? 0) >= 60 * MS_PER_SECOND) {
+      await publishCandles({ state, held, poolOf, at, dir: paperDir, deps });
+      state.lastCandlesAt = at;
+    }
     // PUBLISH BEFORE NOTIFYING. Telegram used to be the only place a fill
     // appeared, which made the notifier the de-facto record -- so a Telegram
     // outage lost the trade. The journal is written first and unconditionally.
@@ -645,23 +671,36 @@ async function handleCommand(command, { state, notifier, deps, feed, universe, s
     case 'start':
     case 'help':
       return reply(formatHelp());
-    case 'status':
+    case 'status': {
+      // Read the journal from disk so /status shows the SAME data as the
+      // dashboard, surviving restarts. The in-memory portfolio resets on every
+      // restart, which made /status show zeros while the dashboard showed real
+      // trades -- two sources of truth, guaranteed to disagree.
+      const paperDir = typeof deps.paperDir === 'string' ? deps.paperDir : JOURNAL.dir;
+      const journal = await loadJournal({ dir: paperDir });
+      const journalBook = journal.book;
+      const book = journalBook ?? state.engine.portfolio;
       return reply(
         formatStatus({
           cycle: state.cycle,
           funnel: state.funnel,
-          book: state.engine.portfolio,
-          equityUsd: portfolioEquityUsd(state.engine.portfolio),
+          book,
+          equityUsd: journalBook ? (journalBook.equityUsd ?? 0) : portfolioEquityUsd(state.engine.portfolio),
           feed,
           profile: universe ? 'early' : 'standard',
           rpcLabel: deps.rpc.endpoint ?? 'unknown',
           uptimeMs: deps.now() - startedAt,
         }),
       );
+    }
     case 'candidates':
       return reply(formatCandidates({ candidates: state.candidates }));
-    case 'positions':
-      return reply(formatPositions({ book: state.engine.portfolio, now: deps.now() }));
+    case 'positions': {
+      const paperDir2 = typeof deps.paperDir === 'string' ? deps.paperDir : JOURNAL.dir;
+      const journal2 = await loadJournal({ dir: paperDir2 });
+      const book2 = journal2.book ?? state.engine.portfolio;
+      return reply(formatPositions({ book: book2, now: deps.now() }));
+    }
     case 'check': {
       const mint = command.args[0];
       if (mint === undefined) return reply('usage: <code>/check &lt;mint&gt;</code>');

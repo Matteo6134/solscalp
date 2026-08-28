@@ -194,11 +194,24 @@ export async function main(argv, deps = {}) {
     return EXIT.OK;
   }
 
-  const intervalS = intFlag(flags.interval, RECORDER.snapshotIntervalSeconds);
+  const useRadar = flags.radar === true;
+  const defaultInterval = useRadar ? 5 : RECORDER.snapshotIntervalSeconds;
+  const intervalS = intFlag(flags.interval, defaultInterval);
   const maxTicks = flags.ticks === undefined ? Infinity : intFlag(flags.ticks, 1);
   const universe = flags.early === true ? UNIVERSE_PROFILES.early : undefined;
   const profile = flags.early === true ? 'early' : 'standard';
   const dir = typeof flags.dir === 'string' ? flags.dir : RECORDER.dir;
+
+  const fetchRadarMints = async () => {
+    const fs = await import('fs');
+    const path = await import('path');
+    const f = path.join(process.cwd(), 'data', 'radar.txt');
+    if (!fs.existsSync(f)) return [];
+    const content = fs.readFileSync(f, 'utf-8');
+    fs.writeFileSync(f, ''); // clear it
+    const mints = [...new Set(content.split('\n').map(m => m.trim()).filter(Boolean))];
+    return mints.map(m => ({ baseMint: m }));
+  };
 
   const env = (deps.loadEnv ?? loadEnv)();
   const rpc = deps.rpc ?? (await buildRpc(env));
@@ -237,11 +250,21 @@ export async function main(argv, deps = {}) {
   while (!stopped && ticks < maxTicks) {
     const ts = now();
     try {
+      const fetchCombinedPools = async (opts) => {
+        const trending = await (deps.getTrendingPools ?? getTrendingPools)(opts).catch(() => []);
+        const radar = useRadar ? await fetchRadarMints() : [];
+        const map = new Map();
+        for (const p of [...trending, ...radar]) {
+          if (p?.baseMint) map.set(p.baseMint, p);
+        }
+        return [...map.values()];
+      };
+
       const { rows, scanned } = await collect({
         universe,
         rpc,
         now,
-        fetchPools: deps.getTrendingPools ?? getTrendingPools,
+        fetchPools: fetchCombinedPools,
         fetchPairs: deps.getBestPairs ?? getBestPairs,
         gate: deps.runGate ?? runGate,
         concurrency: deps.concurrency ?? GATE_CONCURRENCY,

@@ -121,6 +121,20 @@ function readLpEvidence(pair) {
     }
   }
 
+  const isPumpFun =
+    pair.dexId === 'pumpfun' ||
+    (typeof pair.baseToken?.address === 'string' && pair.baseToken.address.endsWith('pump')) ||
+    (typeof pair.mint === 'string' && pair.mint.endsWith('pump'));
+
+  if (isPumpFun && candidates.length === 0) {
+    return Object.freeze({
+      pct: 100,
+      kind: 'lockedPct',
+      lpMint: null,
+      candidates: Object.freeze([{ kind: 'lockedPct', value: 100 }]),
+    });
+  }
+
   const best = candidates.reduce(
     (acc, c) => (acc === null || c.value > acc.value ? c : acc),
     /** @type {{kind: string, value: number}|null} */ (null),

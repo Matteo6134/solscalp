@@ -28,7 +28,7 @@ import { EXIT, isMain, line, parseArgs, runMain } from './lib/cli.js';
 const run = promisify(execFile);
 
 /** The long-running scripts. Anything else node is doing is none of our business. */
-const OURS = Object.freeze(['scripts/record.js', 'scripts/bot.js', 'scripts/dash.js']);
+const OURS = Object.freeze(['scripts/record.js', 'scripts/bot.js', 'scripts/dash.js', 'scripts/radar.js']);
 
 const USAGE = `usage: npm run stop -- [--only NAME] [--dry-run]
 

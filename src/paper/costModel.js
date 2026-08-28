@@ -157,7 +157,7 @@ function readSlippageTolerancePct(quote) {
  * @param {Quote} [p.sellQuote]      live sell quote; required when COSTS.useLiveQuoteForSlippage
  * @returns {CostBreakdown} frozen breakdown
  */
-export function estimateRoundTripCost({ positionSizeUsd, solPriceUsd, buyQuote, sellQuote }) {
+export function estimateRoundTripCost({ positionSizeUsd, solPriceUsd, priorityFeeLamports, buyQuote, sellQuote }) {
   assertPositiveNumber(positionSizeUsd, 'positionSizeUsd');
   assertPositiveNumber(solPriceUsd, 'solPriceUsd');
 
@@ -172,13 +172,17 @@ export function estimateRoundTripCost({ positionSizeUsd, solPriceUsd, buyQuote, 
     ? 'live-quote:priceImpactPct'
     : 'config:SAFETY.layer1.quoteSlippageBps';
 
+  const priorityLamports = typeof priorityFeeLamports === 'number' && priorityFeeLamports > 0
+    ? priorityFeeLamports
+    : COSTS.priorityFeeLamports;
+
   // --- lamport-denominated, size-independent ---
   const baseFeeUsd = lamportsToUsd(
     COSTS.solBaseFeeLamports * LEGS_PER_ROUND_TRIP,
     solPriceUsd,
   );
   const priorityFeeUsd = lamportsToUsd(
-    COSTS.priorityFeeLamports * LEGS_PER_ROUND_TRIP,
+    priorityLamports * LEGS_PER_ROUND_TRIP,
     solPriceUsd,
   );
   const ataRentUsd = lamportsToUsd(COSTS.ataRentLamports, solPriceUsd);

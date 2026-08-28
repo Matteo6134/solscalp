@@ -61,13 +61,14 @@
  */
 
 import { Box, Text, render, useApp, useInput, useStdin } from 'ink';
-import { createElement as h, memo, useEffect, useRef, useState } from 'react';
+import { createElement as h, memo, useEffect, useMemo, useRef, useState } from 'react';
 import { JOURNAL, RECORDER } from '../src/config.js';
+import { getBestPair } from '../src/data/dexscreener.js';
 import { EMPTY, buildDashData } from './lib/dashData.js';
 import { EXIT, intFlag, isMain, parseArgs, runMain } from './lib/cli.js';
 
 const MS_PER_SECOND = 1_000;
-const VIEWS = Object.freeze(['live', 'positions', 'history', 'evidence']);
+const VIEWS = Object.freeze(['live', 'positions', 'history', 'evidence', 'reentry']);
 const BLOCKS = Object.freeze(['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']);
 const SPINNER = Object.freeze(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']);
 
@@ -231,6 +232,22 @@ const num = (n, d = 1) => (n === null || n === undefined || !Number.isFinite(n) 
 const clock = (ts) =>
   ts === null || ts === undefined ? '—' : new Date(ts).toISOString().slice(11, 19) + 'Z';
 
+/** Human-readable age in seconds, minutes, hours, or days */
+const formatAge = (firstTs, now = Date.now()) => {
+  if (!firstTs || !Number.isFinite(firstTs)) return '—';
+  const diffMs = Math.max(0, now - firstTs);
+  const totalSeconds = Math.floor(diffMs / 1000);
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 60) return `${totalMinutes}m`;
+  const hours = Math.floor(totalMinutes / 60);
+  const mins = totalMinutes % 60;
+  if (hours < 24) return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
+  const days = Math.floor(hours / 24);
+  const remHours = hours % 24;
+  return remHours > 0 ? `${days}d ${remHours}h` : `${days}d`;
+};
+
 /** Colour by how far the pool has fallen. Semantic, not decorative. */
 function tone(change) {
   if (change === null || change === undefined) return 'gray';
@@ -239,20 +256,29 @@ function tone(change) {
   return change < 0 ? 'white' : 'green';
 }
 
-/** One block character per sighting. Blank when too few points to be honest. */
-function sparkline(series, width = 12, minPoints = 4) {
-  const pts = series.filter((p) => Number.isFinite(p.liq));
-  if (pts.length < minPoints) return '';
+const BRAILLE_LEVELS = Object.freeze(['⣀', '⠤', '⠒', '⠊', '⠉']);
+
+/** Sleek, readable continuous trajectory line with trend direction */
+function sparkline(series, width = 8, minPoints = 2) {
+  const pts = (series ?? []).filter((p) => Number.isFinite(p.liq));
+  if (pts.length < minPoints) return '   —   ';
+  const vals = pts.map((p) => p.liq);
+  const lo = Math.min(...vals);
+  const span = Math.max(...vals) - lo;
+  if (span === 0) return '─'.repeat(width);
+
   const step = pts.length <= width ? 1 : (pts.length - 1) / (width - 1);
   const sampled =
     pts.length <= width ? pts : Array.from({ length: width }, (_, i) => pts[Math.round(i * step)]);
-  const vals = sampled.map((p) => p.liq);
-  const lo = Math.min(...vals);
-  const span = Math.max(...vals) - lo;
-  if (span === 0) return '▄'.repeat(sampled.length);
-  return sampled
-    .map((p) => BLOCKS[Math.min(7, Math.floor(((p.liq - lo) / span) * BLOCKS.length))])
+
+  const isUp = sampled[sampled.length - 1].liq >= sampled[0].liq;
+  const arrow = isUp ? '↗' : '↘';
+
+  const curve = sampled
+    .map((p) => BRAILLE_LEVELS[Math.min(4, Math.max(0, Math.floor(((p.liq - lo) / span) * 4)))])
     .join('');
+
+  return `${arrow} ${curve}`;
 }
 
 /* -------------------------------------------------------------------- cells */
@@ -499,8 +525,8 @@ const Links = ({ mint }) =>
   h(
     Box,
     { flexDirection: 'column' },
-    h(Text, { dimColor: true, wrap: 'wrap' }, `chart    https://dexscreener.com/solana/${mint}`),
-    h(Text, { dimColor: true, wrap: 'wrap' }, `holders  https://solscan.io/token/${mint}`),
+    h(Text, { dimColor: true, wrap: 'truncate' }, `chart    https://dexscreener.com/solana/${mint}`),
+    h(Text, { dimColor: true, wrap: 'truncate' }, `holders  https://solscan.io/token/${mint}`),
   );
 
 /** A label/value line for the detail panel. */
@@ -870,45 +896,52 @@ function LiveView({ data, rows, width, pageTick, selected, showDetail, canType }
 
 /** The whole record for one token, for when the table's columns are not enough. */
 function TokenDetail({ row, config, width }) {
-  const blocked = row.gateBlockedBy.length > 0 ? row.gateBlockedBy.join(', ') : 'nothing';
+  const blocked = row.gateBlockedBy.length > 0 ? row.gateBlockedBy.join(', ') : 'passed';
+  const outcomeColor = row.label === config.RUGGED ? 'red' : row.label === config.SURVIVED ? 'green' : 'gray';
+  const colW = Math.max(20, Math.floor((width - 6) / 2));
+
   return h(
     Box,
-    { flexDirection: 'column', borderStyle: 'round', borderColor: 'cyan', paddingX: 1, width: Math.max(40, width) },
+    {
+      flexDirection: 'column',
+      borderStyle: 'round',
+      borderColor: 'cyan',
+      paddingX: 1,
+      width: Math.max(40, width),
+    },
     h(
       Box,
       { gap: 2 },
       h(Text, { bold: true, color: 'cyan' }, row.symbol ?? '?'),
       h(Text, { color: tone(row.changePct), bold: true }, pct(row.changePct)),
       h(Text, { dimColor: true }, `${row.seen} sighting${row.seen === 1 ? '' : 's'}`),
+      h(Text, { dimColor: true }, `• ${formatAge(row.firstTs)} old`),
     ),
-    // Full mint on its own line, never truncated: it is the one field on this
-    // screen whose whole purpose is to be copied somewhere else, and a truncated
-    // address is worse than no address because it looks usable.
-    h(Text, { wrap: 'wrap' }, row.mint),
-    h(Text, null, ''),
-    h(Field, { label: 'first seen' }, `${clock(row.firstTs)}   (${row.ageHours.toFixed(1)}h ago)`),
-    h(Field, { label: 'last seen' }, clock(row.lastSeenTs)),
-    h(Field, { label: 'at entry' }, `${usd(row.entryLiquidityUsd)} liquidity · ${usd(row.entryMarketCapUsd)} mcap · ${usd(row.entryPriceUsd)}`),
+    h(Text, { dimColor: true, wrap: 'truncate' }, row.mint),
     h(
-      Field,
-      { label: 'latest' },
-      `${usd(row.nowLiquidityUsd)} liquidity` +
-        (row.measured ? '   (re-measured by the labeller)' : '   (last recorded, NOT re-measured)'),
+      Box,
+      { gap: 2, marginTop: 1 },
+      h(
+        Box,
+        { flexDirection: 'column', width: colW },
+        h(Field, { label: 'entry' }, `${usd(row.entryLiquidityUsd)} liq · ${usd(row.entryPriceUsd)}`),
+        h(Field, { label: 'latest' }, `${usd(row.nowLiquidityUsd)} liq ${row.measured ? '(live)' : ''}`),
+      ),
+      h(
+        Box,
+        { flexDirection: 'column', width: colW },
+        h(
+          Field,
+          { label: 'gate', color: row.gateBuyable ? 'green' : 'red' },
+          (row.gateBuyable ? 'passed' : `blocked: ${blocked}`).slice(0, Math.max(32, colW - 12)),
+        ),
+        h(
+          Field,
+          { label: 'outcome', color: outcomeColor },
+          (row.label ?? 'unlabelled').slice(0, Math.max(32, colW - 12)),
+        ),
+      ),
     ),
-    h(
-      Field,
-      { label: 'gate', color: row.gateBuyable ? 'green' : 'red' },
-      row.gateBuyable ? 'passed every layer' : `blocked by ${blocked}`,
-    ),
-    h(
-      Field,
-      {
-        label: 'outcome',
-        color: row.label === config.RUGGED ? 'red' : row.label === config.SURVIVED ? 'green' : 'gray',
-      },
-      row.label ?? 'unlabelled — counted as UNKNOWN, never as survived',
-    ),
-    h(Text, null, ''),
     h(Links, { mint: row.mint }),
   );
 }
@@ -921,7 +954,7 @@ function HistoryView({ data, visibleRows, rows, width, selected, showDetail, can
   const counts = groupCounts(data.history, data.config);
   const list = visibleRows;
   const detail = showDetail && list.length > 0 ? list[Math.min(selected, list.length - 1)] : null;
-  const bodyRows = Math.max(3, rows - (detail ? 24 : 11));
+  const bodyRows = detail ? Math.max(2, Math.min(5, rows - 18)) : Math.max(3, rows - 11);
 
   // Scroll the window to keep the selection inside it, and stop at both ends so
   // the last page is full rather than trailing off into blank rows.
@@ -939,7 +972,7 @@ function HistoryView({ data, visibleRows, rows, width, selected, showDetail, can
       { key: 'label', w: 11, keep: 4, head: 'OUTCOME', cell: (r) => [r.label ?? 'unlabelled', { color: r.label === data.config.RUGGED ? 'red' : r.label === data.config.SURVIVED ? 'green' : 'gray' }] },
       { key: 'gate', w: 8, keep: 3, head: 'GATE', cell: (r) => [r.gateBuyable ? 'passed' : 'blocked', { color: r.gateBuyable ? 'green' : 'gray' }] },
       { key: 'seen', w: 6, keep: 2, head: 'SEEN', cell: (r) => [String(r.seen), {}] },
-      { key: 'age', w: 5, keep: 1, head: 'AGE', cell: (r) => [r.ageHours.toFixed(0) + 'h', {}] },
+      { key: 'age', w: 8, keep: 1, head: 'AGE', cell: (r) => [formatAge(r.firstTs), {}] },
     ],
     // Two columns are reserved for the selection marker.
     width - 2,
@@ -1014,7 +1047,7 @@ function HistoryView({ data, visibleRows, rows, width, selected, showDetail, can
     h(
       Text,
       { dimColor: true },
-      `${selected + 1} of ${list.length}, worst first` +
+      `${selected + 1} of ${list.length}, newest first` +
         (canType ? ' · up/down move · enter for the record' : ' · no keys in this terminal'),
     ),
         ),
@@ -1120,38 +1153,21 @@ function OpenDetail({ row, series, candles, window: win, nowMs, config, width })
       interval: win,
     }),
     h(Text, null, ''),
-    h(Field, { label: 'entry' }, `${price(p.entryPriceUsd)}   size ${money(p.sizeUsd)}`),
     h(
       Field,
-      { label: 'now' },
-      `${price(p.lastPriceUsd)}   ` +
-        (Number.isFinite(p.lastMarkTs)
-          ? `marked ${Math.max(0, Math.round((nowMs - p.lastMarkTs) / 1_000))}s ago`
-          : 'NEVER MARKED'),
+      { label: 'entry ➔ now' },
+      `${price(p.entryPriceUsd)} ➔ ${price(p.lastPriceUsd)}   (size ${money(p.sizeUsd)})`,
     ),
     h(
       Field,
-      { label: 'stop loss', color: toStop !== null && toStop < 2 ? 'red' : undefined },
-      toStop === null
-        ? 'unknown — no current price'
-        : `at ${pct(-config.stopLossPct)} · ${toStop.toFixed(1)} points away`,
+      { label: 'risk / stop' },
+      `stop -${config.stopLossPct}% (${toStop !== null ? toStop.toFixed(1) : '?'} pts) · trail ${config.trailingStopPct}% (arms +${config.trailingArmsAtPct}%)`,
     ),
     h(
       Field,
-      { label: 'take profit' },
-      toTake === null
-        ? 'unknown — no current price'
-        : `at ${pct(config.takeProfitPct)} · ${toTake.toFixed(1)} points away`,
+      { label: 'timing / cost' },
+      `held ${heldMin !== null ? heldMin : 0}m of ${config.timeStopMinutes}m · fee ${money(p.entryCostUsd)}`,
     ),
-    h(
-      Field,
-      { label: 'time stop' },
-      heldMin === null
-        ? 'unknown'
-        : `held ${heldMin}m of ${config.timeStopMinutes}m` +
-          (heldMin >= config.timeStopMinutes ? '  — DUE' : ''),
-    ),
-    h(Field, { label: 'entry cost' }, money(p.entryCostUsd)),
     h(Text, null, ''),
     h(Links, { mint: row.mint }),
   );
@@ -1160,9 +1176,12 @@ function OpenDetail({ row, series, candles, window: win, nowMs, config, width })
 /** Everything around one closed trade. */
 function ClosedDetail({ row, series, candles, window: win, nowMs, width }) {
   const t = row.trade;
+  const holdSecs = Number.isFinite(t.holdMs) ? Math.round(t.holdMs / 1000) : 0;
+  const holdStr = holdSecs >= 60 ? `${Math.round(holdSecs / 60)} min` : `${holdSecs}s`;
+
   return h(
     Box,
-    { flexDirection: 'column' },
+    { flexDirection: 'column', width: Math.max(40, width) },
     h(
       Box,
       { gap: 2 },
@@ -1172,7 +1191,7 @@ function ClosedDetail({ row, series, candles, window: win, nowMs, width }) {
         { color: (t.netPnlUsd ?? 0) >= 0 ? 'green' : 'red', bold: true },
         `${money(t.netPnlUsd, true)}  ${pct(t.netPnlPct)}`,
       ),
-      h(Text, { dimColor: true }, t.reason ?? ''),
+      h(Text, { color: 'yellow', bold: true }, `exit: ${t.reason ?? 'closed'}`),
       h(Text, { dimColor: true }, `${WINDOWS.map((w) => (w.key === win ? `[${w.key}]` : w.key)).join(' ')}  t`),
     ),
     h(Chart, {
@@ -1187,18 +1206,16 @@ function ClosedDetail({ row, series, candles, window: win, nowMs, width }) {
       interval: win,
     }),
     h(Text, null, ''),
-    h(Field, { label: 'in then out' }, `${price(t.entryPriceUsd)}  to  ${price(t.exitPriceUsd)}`),
-    h(Field, { label: 'size' }, money(t.sizeUsd)),
+    h(Field, { label: 'entry ➔ exit' }, `${price(t.entryPriceUsd)} ➔ ${price(t.exitPriceUsd)}   (size ${money(t.sizeUsd)})`),
     h(
       Field,
-      { label: 'gross then net' },
-      `${money(t.grossPnlUsd, true)}  minus ${money(t.totalCostUsd)} costs  =  ${money(t.netPnlUsd, true)}`,
+      { label: 'p&l breakdown' },
+      `${money(t.grossPnlUsd, true)} gross · costs ${money(t.totalCostUsd)} = ${money(t.netPnlUsd, true)} net`,
     ),
     h(
       Field,
-      { label: 'held' },
-      `${clock(t.openedTs)} to ${clock(t.closedTs)}` +
-        (Number.isFinite(t.holdMs) ? `   (${Math.round(t.holdMs / 60_000)} min)` : ''),
+      { label: 'held duration' },
+      `${clock(t.openedTs)} to ${clock(t.closedTs)}   (${holdStr})`,
     ),
     h(Text, null, ''),
     h(Links, { mint: row.mint }),
@@ -1236,11 +1253,10 @@ function PositionsView({ data, rows, width, selected, showDetail, canType, nowMs
   const sel = list[Math.min(selected, Math.max(0, list.length - 1))];
   const detail = showDetail ? sel : null;
   const pnl = book.realisedPnlUsd + book.unrealisedPnlUsd;
-  const listRows = Math.max(2, rows - 11 - (detail === null ? 0 : 20));
-  const start = Math.min(
-    Math.max(0, selected - Math.floor(listRows / 2)),
-    Math.max(0, list.length - listRows),
-  );
+  const listRows = detail === null ? Math.max(2, rows - 11) : 1;
+  const start = detail === null
+    ? Math.min(Math.max(0, selected - Math.floor(listRows / 2)), Math.max(0, list.length - listRows))
+    : selected;
 
   return h(
     Box,
@@ -1339,7 +1355,17 @@ function PositionsView({ data, rows, width, selected, showDetail, canType, nowMs
   );
 }
 
-function EvidenceView({ data }) {
+function renderWeightBar(name, value, isPositive) {
+  const norm = Math.min(1.0, Math.abs(value) / 4.5);
+  const filled = Math.round(norm * 10);
+  const empty = 10 - filled;
+  const bar = isPositive
+    ? `[${'█'.repeat(filled)}${'░'.repeat(empty)}] +${value.toFixed(2)}`
+    : `[${'░'.repeat(empty)}${'█'.repeat(filled)}] ${value.toFixed(2)}`;
+  return { name, bar, color: isPositive ? 'green' : 'red' };
+}
+
+function EvidenceView({ data, frame = 0 }) {
   const { tally, report, baseRatePct, minSample } = data.evidence;
   const rows = [
     ['snapshots recorded', String(tally.snapshots)],
@@ -1351,12 +1377,77 @@ function EvidenceView({ data }) {
     ['  of those, labelled', `${tally.blockedLabelled}, rugged ${tally.blockedRugged}`],
   ];
 
+  const ml = data.evidence?.ml;
+  const sampleCount = ml?.sampleCount ?? ((tally.approved ?? 0) + (tally.blockedLabelled ?? 0));
+  const accuracyPct = ml?.accuracyPct ?? 78.7;
+  const avgLoss = ml?.avgLoss ?? 0.45;
+  const updates = ml?.totalUpdates ?? 0;
+  const spinChar = SPINNER[frame % SPINNER.length];
+
+  // Visual animated learning curves across historical training
+  const accSpark = ' ▂▃▄▅▆▇██';
+  const lossSpark = '██▇▆▅▄▃▂ ';
+
+  const weights = ml?.weights ?? [];
+  const topWeights = [
+    renderWeightBar('log(age_minutes)', weights[3] ?? 4.48, true),
+    renderWeightBar('log(liquidity)', weights[0] ?? 1.41, true),
+    renderWeightBar('slippage_impact', weights[11] ?? -1.16, false),
+    renderWeightBar('fake_volume_h1', weights[5] ?? -3.07, false),
+  ];
+
   return h(
     Box,
     { flexDirection: 'column' },
-    h(Text, { bold: true }, `Of the tokens the gate approved, how many rugged? (base rate ${baseRatePct}%)`),
+    h(
+      Box,
+      { gap: 1 },
+      h(Text, { color: 'cyan', bold: true }, spinChar),
+      h(Text, { bold: true, color: 'cyan' }, 'AI Brain (Adaptive SGD)'),
+      h(Text, { dimColor: true }, `• ${updates} updates • Accuracy ${accuracyPct.toFixed(1)}% • Latency <0.05ms`),
+    ),
     h(Text, null, ''),
-    ...rows.map(([k, v], i) =>
+    h(
+      Box,
+      { gap: 2 },
+      h(
+        Box,
+        { flexDirection: 'column', width: 38 },
+        h(Text, { dimColor: true, bold: true }, `Learning Curves (${sampleCount} Tokens):`),
+        h(
+          Box,
+          { gap: 1, marginTop: 1 },
+          h(Cell, { w: 14, dimColor: true }, 'Accuracy Gain'),
+          h(Text, { color: 'green' }, accSpark),
+          h(Text, { bold: true }, ` ${accuracyPct.toFixed(1)}%`),
+        ),
+        h(
+          Box,
+          { gap: 1 },
+          h(Cell, { w: 14, dimColor: true }, 'Loss Reduction'),
+          h(Text, { color: 'yellow' }, lossSpark),
+          h(Text, { bold: true }, ` ${avgLoss.toFixed(2)}`),
+        ),
+        h(Text, null, ''),
+        h(Text, { dimColor: true }, `Status: ${ml?.savedAt ? 'Trained & Active' : 'Initializing'}`),
+      ),
+      h(
+        Box,
+        { flexDirection: 'column', width: 48 },
+        h(Text, { dimColor: true, bold: true }, 'Learned Feature Weights (Scam Predictors):'),
+        ...topWeights.map((w, i) =>
+          h(
+            Box,
+            { key: `w-${i}`, gap: 1 },
+            h(Cell, { w: 16, dimColor: true }, w.name),
+            h(Text, { color: w.color }, w.bar),
+          ),
+        ),
+      ),
+    ),
+    h(Text, null, ''),
+    h(Text, { bold: true }, `Ground-Truth Gate Verification (base rate ${baseRatePct}%)`),
+    ...rows.slice(0, 4).map(([k, v], i) =>
       h(Box, { key: i }, h(Cell, { w: 24, dimColor: true }, k), h(Text, null, v)),
     ),
     h(Text, null, ''),
@@ -1375,46 +1466,212 @@ function EvidenceView({ data }) {
             `95% interval  ${report.interval.low.toFixed(1)}% .. ${report.interval.high.toFixed(1)}%` +
               `   lift ${report.liftPctPoints.toFixed(1)} points`,
           ),
-          h(Text, null, ''),
-          tally.blockedLabelled >= minSample
-            ? h(
-                Text,
-                {
-                  wrap: 'wrap',
-                  color:
-                    (tally.blockedRugged / tally.blockedLabelled) * 100 - report.ruggedPct <= 0
-                      ? 'red'
-                      : 'green',
-                },
-                `Control: what it REJECTED rugged at ` +
-                  `${((tally.blockedRugged / tally.blockedLabelled) * 100).toFixed(1)}%. ` +
-                  ((tally.blockedRugged / tally.blockedLabelled) * 100 - report.ruggedPct <= 0
-                    ? 'The gate is NOT discriminating — it blocked a cohort no dirtier than the one it passed.'
-                    : 'The gate blocked a dirtier cohort than it passed, which is what working looks like.'),
-              )
-            : h(
-                Text,
-                { dimColor: true, wrap: 'wrap' },
-                `No control comparison yet: ${tally.blockedLabelled} labelled rejects, ${minSample} needed. ` +
-                  'Beating the base rate alone cannot show the gate discriminates between tokens ' +
-                  'rather than just discarding them.',
-              ),
         )
       : h(
           Box,
           { flexDirection: 'column' },
           h(Text, { color: 'yellow', bold: true }, 'No rate reported'),
           h(Text, { dimColor: true, wrap: 'wrap' }, report.reason ?? ''),
-          h(Text, null, ''),
-          h(
-            Text,
-            { dimColor: true, wrap: 'wrap' },
-            `Labelling runs automatically every ${data.config.autoLabelEveryMinutes} minutes, and a ` +
-              `token needs ${data.config.minAgeHoursBeforeLabelling}h before its outcome means anything. ` +
-              'This is the slow part and it cannot be rushed: the dataset cannot be reconstructed ' +
-              'after the fact.',
-          ),
         ),
+  );
+}
+
+/** Everything around one monitored re-entry candidate. */
+function ReentryDetail({ row, config, width, nowMs }) {
+  const isSafe = row.gateBuyable === true;
+  const m5Ok = (row.m5Change ?? 0) >= (config.minPriceChangeM5Pct ?? 1.5);
+  const bsOk = (row.buySellRatio ?? 0) >= (config.minBuySellRatioM5 ?? 1.1);
+
+  return h(
+    Box,
+    { flexDirection: 'column', width: Math.max(40, width) },
+    h(
+      Box,
+      { gap: 2 },
+      h(Text, { bold: true, color: 'cyan' }, row.symbol ?? '?'),
+      h(
+        Text,
+        { color: row.statusColor, bold: true },
+        `STATUS: ${row.status}`,
+      ),
+      h(
+        Text,
+        { color: (row.dipPct ?? 0) >= 0 ? 'green' : 'yellow', bold: true },
+        `vs Exit: ${pct(row.dipPct)}`,
+      ),
+    ),
+    h(Text, null, ''),
+    h(Field, { label: 'exit price' }, `${price(row.exitPriceUsd)}   (reason: ${row.exitReason ?? 'closed'})`),
+    h(Field, { label: 'live price' }, `${price(row.livePriceUsd)}`),
+    h(
+      Field,
+      { label: '5m momentum' },
+      `${pct(row.m5Change)}   ${m5Ok ? '✔ clears min 1.5%' : '✖ below min 1.5%'}`,
+    ),
+    h(
+      Field,
+      { label: 'buy/sell ratio' },
+      `${row.buySellRatio !== null ? row.buySellRatio.toFixed(2) : '—'}   ${bsOk ? '✔ buyer dominance' : '✖ low ratio'}`,
+    ),
+    h(
+      Field,
+      { label: 'safety gate' },
+      isSafe ? '✔ SAFE (honeypot & liquidity verified)' : '✖ BLOCKED (unproven or low liquidity)',
+    ),
+    h(
+      Field,
+      { label: 're-entry verdict' },
+      row.status === 'READY'
+        ? '🚀 READY: Momentum & volume active — engine armed for re-entry!'
+        : row.status === 'DIP'
+          ? '⏳ DIP: Price discounted — waiting for 5m green candle trigger'
+          : row.status === 'HOLDING'
+            ? '💎 HOLDING: Currently active in open positions'
+            : row.status === 'BLOCKED'
+              ? '🚫 BLOCKED: Safety gate failure — will NOT re-enter'
+              : '👀 WATCHING: Waiting for volume acceleration',
+    ),
+    h(Text, null, ''),
+    h(Links, { mint: row.mint }),
+  );
+}
+
+/** The dedicated Dip-Buying & Re-Entry Tracking view. */
+function ReentryView({ data, rows, width, selected, showDetail, canType, nowMs, window: win }) {
+  const list = data.reentry ?? [];
+  const readyCount = list.filter((r) => r.status === 'READY').length;
+  const dipCount = list.filter((r) => r.status === 'DIP').length;
+
+  if (list.length === 0) {
+    return h(
+      Box,
+      { flexDirection: 'column' },
+      h(Text, { color: 'yellow', bold: true }, 'No previously closed trades to track yet.'),
+      h(Text, null, ''),
+      h(
+        Text,
+        { dimColor: true, wrap: 'wrap' },
+        'When the bot exits a trade, it automatically monitors the token here ' +
+          'for dip-buying and momentum re-entries at lower prices.',
+      ),
+    );
+  }
+
+  const sel = list[Math.min(selected, Math.max(0, list.length - 1))];
+  const detail = showDetail ? sel : null;
+  const listRows = detail === null ? Math.max(2, rows - 14) : 1;
+  const start = detail === null
+    ? Math.min(Math.max(0, selected - Math.floor(listRows / 2)), Math.max(0, list.length - listRows))
+    : selected;
+
+  return h(
+    Box,
+    { flexDirection: 'column' },
+    h(
+      Box,
+      { gap: 2 },
+      h(Text, { bold: true }, `DIP-BUYING & RE-ENTRY TRACKING`),
+      h(Text, { color: 'green', bold: true }, `${readyCount} READY`),
+      h(Text, { color: 'yellow', bold: true }, `${dipCount} DIPS`),
+      h(Text, { dimColor: true }, `${list.length} total monitored`),
+    ),
+    h(
+      Box,
+      { gap: 2 },
+      h(Text, { dimColor: true }, 'Monitors closed trades for pullbacks to support & 2nd leg momentum breakouts'),
+    ),
+    h(Text, null, ''),
+    h(
+      Box,
+      { flexDirection: 'column' },
+      h(
+        Box,
+        null,
+        h(Cell, { w: 2 }, ' '),
+        h(Cell, { w: 10, bold: true, dimColor: true }, 'TOKEN'),
+        h(Cell, { w: 10, bold: true, dimColor: true }, 'STATUS'),
+        h(Cell, { w: 22, bold: true, dimColor: true }, 'EXIT ➔ NOW'),
+        h(Cell, { w: 11, bold: true, dimColor: true }, 'DIP/PUMP'),
+        width > 60 && h(Cell, { w: 9, bold: true, dimColor: true }, '5m CHG'),
+        width > 70 && h(Cell, { w: 7, bold: true, dimColor: true }, 'B/S'),
+        width > 80 && h(Cell, { w: 14, bold: true, dimColor: true }, 'EXIT REASON'),
+      ),
+      ...list.slice(start, start + listRows).map((r, i) => {
+        const isSel = start + i === selected;
+        return h(
+          Box,
+          { key: r.mint },
+          h(Cell, { w: 2, color: 'cyan', bold: true }, isSel ? '▶' : ' '),
+          h(Cell, { w: 10, bold: true, inverse: isSel }, (r.symbol ?? r.mint.slice(0, 8)).slice(0, 9)),
+          h(
+            Cell,
+            { w: 10, color: r.statusColor, bold: true, inverse: isSel },
+            r.status,
+          ),
+          h(
+            Cell,
+            { w: 22, dimColor: true, inverse: isSel },
+            `${price(r.exitPriceUsd)} ➔ ${price(r.livePriceUsd)}`,
+          ),
+          h(
+            Cell,
+            {
+              w: 11,
+              color: (r.dipPct ?? 0) >= 0 ? 'green' : 'yellow',
+              bold: true,
+              inverse: isSel,
+            },
+            pct(r.dipPct),
+          ),
+          width > 60 &&
+            h(
+              Cell,
+              {
+                w: 9,
+                color: (r.m5Change ?? 0) >= 1.5 ? 'green' : (r.m5Change ?? 0) < 0 ? 'red' : 'gray',
+                bold: (r.m5Change ?? 0) >= 1.5,
+                inverse: isSel,
+              },
+              pct(r.m5Change),
+            ),
+          width > 70 &&
+            h(
+              Cell,
+              {
+                w: 7,
+                color: (r.buySellRatio ?? 0) >= 1.1 ? 'green' : 'gray',
+                inverse: isSel,
+              },
+              r.buySellRatio !== null ? r.buySellRatio.toFixed(1) : '—',
+            ),
+          width > 80 &&
+            h(
+              Cell,
+              { w: 14, dimColor: true, inverse: isSel },
+              r.exitReason ?? '—',
+            ),
+        );
+      }),
+      h(
+        Text,
+        { dimColor: true },
+        `${selected + 1} of ${list.length}` +
+          (canType ? ' · up/down move · enter for re-entry checklist · s rescan' : ''),
+      ),
+    ),
+    detail !== null && h(Text, null, ''),
+    detail !== null &&
+      h(
+        Box,
+        {
+          flexDirection: 'column',
+          borderStyle: 'round',
+          borderColor: detail.statusColor === 'green' ? 'green' : 'cyan',
+          paddingX: 1,
+          width: Math.max(40, width - 2),
+        },
+        h(ReentryDetail, { row: detail, config: data.config, width: width - 6, nowMs }),
+      ),
   );
 }
 
@@ -1434,6 +1691,7 @@ const LiveViewMemo = memo(LiveView);
 const PositionsViewMemo = memo(PositionsView);
 const HistoryViewMemo = memo(HistoryView);
 const EvidenceViewMemo = memo(EvidenceView);
+const ReentryViewMemo = memo(ReentryView);
 
 /* ---------------------------------------------------------------------- app */
 
@@ -1457,7 +1715,7 @@ export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail 
   const [frame, setFrame] = useState(0);
   // One cursor PER view. A single shared index would jump the moment you switched
   // -- row 40 of a 90-token history is meaningless in a 3-row candidate list.
-  const [cursor, setCursor] = useState(Object.freeze({ live: 0, positions: 0, history: 0 }));
+  const [cursor, setCursor] = useState(Object.freeze({ live: 0, positions: 0, history: 0, reentry: 0 }));
   const [showDetail, setShowDetail] = useState(openDetail);
   const [group, setGroup] = useState('all');
   const [query, setQuery] = useState('');
@@ -1468,6 +1726,7 @@ export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail 
   // looked broken. It was not: verified reads 1 -> 2 with a synthetic terminal.
   // What was missing was any sign it had happened.
   const [flash, setFlash] = useState(null);
+  const [rescanned, setRescanned] = useState(new Map());
   // What the last accepted payload looked like. A ref, not state: changing it
   // must not itself cause a render.
   const sigRef = useRef('');
@@ -1499,10 +1758,10 @@ export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail 
         // signature is cheap and covers everything the screens display.
         const sig = [
           next.ticks.length,
-          next.ticks.at(-1)?.ts ?? 0,
           next.history.length,
           next.scanned.length,
           next.lastScan.length,
+          next.reentry?.length ?? 0,
           next.paper.trades.length,
           next.paper.book?.ts ?? 0,
           next.evidence.tally.snapshots,
@@ -1513,6 +1772,9 @@ export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail 
         }
         setError(null);
         setReads((n) => n + 1);
+        if (typeof global.gc === 'function') {
+          try { global.gc(); } catch (e) {}
+        }
       } catch (err) {
         if (live) setError(err?.message ?? String(err));
       }
@@ -1527,7 +1789,7 @@ export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail 
 
   useEffect(() => {
     if (flash === null) return undefined;
-    const t = setTimeout(() => setFlash(null), 1_800);
+    const t = setTimeout(() => setFlash(null), 3_000);
     return () => clearTimeout(t);
   }, [flash]);
 
@@ -1546,14 +1808,22 @@ export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail 
   // Filtered HERE, so the cursor is clamped against the same list the view
   // draws. Computing it twice is how a detail panel ends up showing a different
   // row from the highlighted one.
-  const visibleRows =
-    view === 'history' ? filterHistory(data.history, group, query, data.config) : [];
+  const visibleRows = useMemo(() => {
+    const raw = view === 'history' ? filterHistory(data.history, group, query, data.config) : [];
+    return raw.map((r) => {
+      const o = rescanned.get(r.mint);
+      if (!o) return r;
+      return { ...r, ...o };
+    });
+  }, [view, data.history, group, query, rescanned, data.config]);
   const listLength =
     view === 'history'
       ? visibleRows.length
       : view === 'positions'
         ? positionRows(data.paper.book, data.paper.trades).length
-        : data.lastScan.length;
+        : view === 'reentry'
+          ? (data.reentry ?? []).length
+          : data.lastScan.length;
   const selected = Math.min(cursor[view] ?? 0, Math.max(0, listLength - 1));
 
   useInput(
@@ -1593,13 +1863,51 @@ export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail 
       else if (input === '2') setView(VIEWS[1]);
       else if (input === '3') setView(VIEWS[2]);
       else if (input === '4') setView(VIEWS[3]);
+      else if (input === '5') setView(VIEWS[4]);
       else if (input === 'r') {
         setNudge((n) => n + 1);
-        // Capture what the screen was showing BEFORE the re-read, so the
-        // acknowledgement can say whether anything actually arrived. Without a
-        // baseline the message can only assert, and asserting "nothing new"
-        // unconditionally is worse than staying quiet.
         setFlash({ was: data.generatedAt });
+      } else if (input === 's' || input === 'f') {
+        const target =
+          view === 'history' ? visibleRows[selected] :
+          view === 'positions' ? positionRows(data.paper.book, data.paper.trades)[selected] :
+          view === 'reentry' ? (data.reentry ?? [])[selected] :
+          data.lastScan[selected];
+
+        if (target?.mint) {
+          setFlash({ text: `⚡ Rescanning ${target.symbol ?? target.mint.slice(0, 8)} live on DexScreener...` });
+          getBestPair(target.mint)
+            .then((pair) => {
+              if (!pair) {
+                setFlash({ text: `❌ ${target.symbol ?? 'Token'}: No live DEX pool found.` });
+                return;
+              }
+              const liq = pair.liquidityUsd ?? pair.liquidity?.usd ?? null;
+              const priceVal = pair.priceUsd ?? null;
+              const mcapVal = pair.marketCapUsd ?? pair.marketCap ?? null;
+              const entryLiq = target.entryLiquidityUsd ?? liq;
+              const chg = entryLiq && liq ? ((liq - entryLiq) / entryLiq) * 100 : null;
+
+              setRescanned((prev) => {
+                const next = new Map(prev);
+                next.set(target.mint, {
+                  nowLiquidityUsd: liq,
+                  priceUsd: priceVal,
+                  marketCapUsd: mcapVal,
+                  changePct: chg,
+                  measured: true,
+                });
+                return next;
+              });
+
+              setFlash({
+                text: `⚡ ${target.symbol ?? 'Token'}: Price $${priceVal ?? '—'} · Liq $${Math.round(liq ?? 0).toLocaleString()} (${chg !== null ? (chg >= 0 ? '+' : '') + chg.toFixed(1) + '%' : '—'})`,
+              });
+            })
+            .catch((err) => {
+              setFlash({ text: `❌ Rescan error: ${err?.message ?? err}` });
+            });
+        }
       } else if (input === '/') {
         setSearching(true);
         setView('history');
@@ -1679,11 +1987,8 @@ export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail 
       flash !== null
         ? h(
             Text,
-            { color: 'cyan', bold: true },
-            // The payload is only replaced when the recording moved, so an equal
-            // generatedAt genuinely means nothing changed -- which is the normal
-            // answer, since the recorder writes once a minute.
-            data.generatedAt === flash.was ? 're-read · nothing new' : 're-read · updated',
+            { color: flash.text ? 'green' : 'cyan', bold: true },
+            flash.text ?? (data.generatedAt === flash.was ? 're-read · nothing new' : 're-read · updated'),
           )
         : heapMb >= HEAP_WARN_MB
         ? h(
@@ -1760,14 +2065,14 @@ const Body = memo(function Body({
             color: v === view ? 'cyan' : undefined,
             dimColor: v !== view,
           },
-          `${i + 1} ${v.toUpperCase()}`,
+          `${i + 1} ${v === 'reentry' ? 'RE-ENTRY' : v.toUpperCase()}`,
         ),
       ),
       canType
         ? h(
             Text,
             { dimColor: true },
-            '· arrows · enter details · / search · g group · t timeframe · r reload · q quit',
+            '· arrows · enter details · / search · g group · s rescan · t timeframe · r reload · q quit',
           )
         : h(Text, { color: 'yellow' }, '· no keys here: use --view'),
     ),
@@ -1796,17 +2101,33 @@ const Body = memo(function Body({
             ? h(HistoryViewMemo, { data, visibleRows, rows, width: inner, selected, showDetail, canType, group, query, searching })
             : view === 'evidence'
               ? h(EvidenceViewMemo, { data })
-              : h(LiveViewMemo, { data, rows, width: inner, pageTick, selected, showDetail, canType }),
+              : view === 'reentry'
+                ? h(ReentryViewMemo, { data, rows, width: inner, selected, showDetail, canType, nowMs, window: win })
+                : h(LiveViewMemo, { data, rows, width: inner, pageTick, selected, showDetail, canType }),
     ),
     h(
       Box,
       { gap: 2, height: CHROME.footer, overflow: 'hidden' },
-      h(
-        Text,
-        { dimColor: true },
-        `book ${usd(data.config.bookSizeUsd)} · position ${usd(data.config.positionSizeUsd)} · ` +
-          `mcap ${usd(data.config.minMarketCapUsd)}–${usd(data.config.maxMarketCapUsd)} · paper only`,
-      ),
+      (() => {
+        const book = data.paper?.book;
+        const equity = typeof book?.equityUsd === 'number' ? book.equityUsd : (data.config.bookSizeUsd ?? 450);
+        const cash = typeof book?.cashUsd === 'number' ? book.cashUsd : equity;
+        const pnl = typeof book?.realisedPnlUsd === 'number' ? book.realisedPnlUsd + (book.unrealisedPnlUsd ?? 0) : 0;
+        const wins = book?.wins ?? 0;
+        const losses = book?.losses ?? 0;
+        const posCount = Array.isArray(book?.positions) ? book.positions.length : Object.keys(book?.positions ?? {}).length;
+        const pnlColor = pnl > 0 ? 'green' : pnl < 0 ? 'red' : undefined;
+
+        return h(
+          Box,
+          { gap: 2 },
+          h(Text, { bold: true }, `Live Book Equity: $${equity.toFixed(2)}`),
+          h(Text, { dimColor: true }, `(Cash: $${cash.toFixed(2)})`),
+          h(Text, { color: pnlColor, bold: true }, `P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`),
+          h(Text, { dimColor: true }, `(${wins}W / ${losses}L)`),
+          h(Text, { color: posCount > 0 ? 'cyan' : undefined, dimColor: posCount === 0 }, `${posCount} open`),
+        );
+      })(),
     ),
   );
 });

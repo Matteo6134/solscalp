@@ -43,7 +43,7 @@ module.exports = {
     {
       name: 'solscalp-bot',
       script: 'scripts/bot.js',
-      args: '--early --paper --interval 60',
+      args: '--early --paper',
       cwd: __dirname,
       autorestart: true,
       restart_delay: 15_000,

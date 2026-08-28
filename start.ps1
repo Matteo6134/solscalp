@@ -24,7 +24,7 @@
 #          npm run stop           stop them, verified
 
 param(
-  [ValidateSet('all', 'record', 'bot')]
+  [ValidateSet('all', 'record', 'bot', 'radar')]
   [string]$Only = 'all'
 )
 
@@ -83,16 +83,20 @@ Write-Host "paper only - there is no keypair in this repo and nothing here can s
 Write-Host ""
 
 $started = @()
+if ($Only -eq 'all' -or $Only -eq 'radar') {
+  $new = Start-Solscalp -Name 'radar' -Script 'scripts/radar.js' -ScriptArgs @()
+  if ($new) { $started += $new }
+}
 if ($Only -eq 'all' -or $Only -eq 'record') {
   # The evidence collector. This is the one that must not miss time.
-  $new = Start-Solscalp -Name 'record' -Script 'scripts/record.js' -ScriptArgs @('--early')
+  $new = Start-Solscalp -Name 'record' -Script 'scripts/record.js' -ScriptArgs @('--early', '--radar')
   if ($new) { $started += $new }
 }
 if ($Only -eq 'all' -or $Only -eq 'bot') {
-  # 60s keeps the pair inside GeckoTerminal's 30 req/min per-IP budget; the
-  # limiters are per-process and cannot see each other.
+  # The bot now uses config defaults: 15s when flat, 5s when in a position.
+  # Live prices are fetched directly via DexScreener to bypass API limits.
   $new = Start-Solscalp -Name 'bot' -Script 'scripts/bot.js' `
-    -ScriptArgs @('--early', '--paper', '--interval', '60')
+    -ScriptArgs @('--early', '--paper')
   if ($new) { $started += $new }
 }
 
@@ -124,5 +128,3 @@ Write-Host "Logs:  data\record.log  data\bot.log" -ForegroundColor DarkGray
 Write-Host "Stop:  npm run stop" -ForegroundColor DarkGray
 Write-Host "A running process keeps the credentials it loaded at startup -- editing" -ForegroundColor DarkGray
 Write-Host ".env does not reach it, so restart after changing a token." -ForegroundColor DarkGray
-
-

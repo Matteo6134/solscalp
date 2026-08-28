@@ -21,3 +21,5 @@ data/*.out
 data/*.err
 data/probe.txt
 data/manual.*
+data/radar*.txt
+data/*.txt

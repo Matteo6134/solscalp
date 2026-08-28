@@ -39,7 +39,9 @@ import {
   assertPositiveNumber,
   assertTimestampMs,
 } from './guards.js';
-import { closePosition, markPositions, openPosition, shouldKillSwitch } from './portfolio.js';
+import { closePosition, markPositions, openPosition, reducePosition, shouldKillSwitch } from './portfolio.js';
+import { extractFeatures } from '../ml/features.js';
+import { defaultModel } from '../ml/model.js';
 
 /** Unit conversions, not tunables. */
 const MS_PER_MINUTE = 60_000;
@@ -232,6 +234,7 @@ export function decideEntry({
   now,
   universe,
   momentum = true,
+  minAiScore = 0.25,
 }) {
   assertPlainObject(pair, 'pair');
   assertPlainObject(portfolio, 'portfolio');
@@ -304,6 +307,15 @@ export function decideEntry({
   );
   }
 
+  // --- AI Machine Learning Survival Score ---
+  const features = extractFeatures({ pair, signals, gateResult, costBreakdown });
+  const aiScore = defaultModel.predict(features);
+  if (typeof minAiScore === 'number' && aiScore < minAiScore) {
+    reasons.push(
+      `AI survival score ${(aiScore * 100).toFixed(1)}% below minimum ${(minAiScore * 100).toFixed(1)}% (predicted high rug risk)`,
+    );
+  }
+
   // --- and it must pay for itself ---
   // breakEvenMovePct THROWS when the round trip consumes the whole position (a
   // pool so thin that the probe moves the price ~100%). That is the most emphatic
@@ -329,6 +341,7 @@ export function decideEntry({
     reasons: Object.freeze(reasons),
     signals,
     costs: Object.freeze({ ...costs }),
+    aiScore,
   });
 }
 
@@ -513,42 +526,82 @@ export function decideExit({ position, pair, priceUsd, now, peakPriceUsd, gateRe
   // 2. stop loss
   if (pnl <= -cfg.stopLossPct) {
     reasons.push(`stop loss: ${pnl.toFixed(2)}% at or below -${cfg.stopLossPct}%`);
-    return frozenExit(true, EXIT_REASON.STOP_LOSS, reasons, false, pnl, peak);
+    return frozenExit(true, EXIT_REASON.STOP_LOSS, reasons, false, pnl, peak, 1.0);
   }
 
-  // 3. trailing stop -- armed only after the position has been up trailingArmsAtPct
+  // 3. 3-Stage Laddered Profit Taking (Option 2)
+  const scaleOutCount = pos.scaleOutCount ?? 0;
+  // Stage 1: Sell 33.3% at +25% profit (secures principal + fees)
+  if (scaleOutCount === 0 && pnl >= 25) {
+    reasons.push(`ladder TP 1/3: securing 33% of position at +${pnl.toFixed(2)}% profit`);
+    return frozenExit(true, EXIT_REASON.TAKE_PROFIT, reasons, false, pnl, peak, 0.333);
+  }
+  // Stage 2: Sell 50% of remaining (33% of original) at +50% profit (guarantees winning trade)
+  if (scaleOutCount === 1 && pnl >= 50) {
+    reasons.push(`ladder TP 2/3: locking another 33% at +${pnl.toFixed(2)}% profit`);
+    return frozenExit(true, EXIT_REASON.TAKE_PROFIT, reasons, false, pnl, peak, 0.5);
+  }
+  // Stage 3: Remaining 34% is the UNLIMITED MOONBAG (Rides with trailing stop for 100x / 10,000% gains!)
+
+  // 4. smart volume-aware trailing stop
   const peakGainPct = pnlPct(entry, peak);
   const armed = peakGainPct >= cfg.trailingArmsAtPct;
-  if (armed && drawdownFromPeakPct >= cfg.trailingStopPct) {
-    reasons.push(
-      `trailing stop: ${drawdownFromPeakPct.toFixed(2)}% off the peak ` +
-        `(peak +${peakGainPct.toFixed(2)}%, armed at +${cfg.trailingArmsAtPct}%, ` +
-        `trail ${cfg.trailingStopPct}%)`,
-    );
-    return frozenExit(true, EXIT_REASON.TRAILING_STOP, reasons, false, pnl, peak);
+  // Give the moonbag 15% trail for big swings, or 10% for standard trades
+  const TRAIL_PCT = scaleOutCount >= 2 ? 15 : 10;
+  // Never let an armed winning trade drop below +8% (ensures fees are covered + profit)
+  const BREAKEVEN_FLOOR_PCT = 8;
+  
+  if (armed) {
+    // 4a. The Floor (protect capital no matter what the volume is doing)
+    if (pnl <= BREAKEVEN_FLOOR_PCT) {
+      reasons.push(
+        `breakeven floor: peak was +${peakGainPct.toFixed(2)}%, dropped to +${pnl.toFixed(2)}% ` +
+          `which is the breakeven floor. Selling to protect against fees.`
+      );
+      return frozenExit(true, EXIT_REASON.TRAILING_STOP, reasons, false, pnl, peak, 1.0);
+    }
+    
+    // 4b. The Standard Trail
+    if (drawdownFromPeakPct >= TRAIL_PCT) {
+      const bsRatio = num(pair?.buySellRatioM5) ?? 0;
+      if (bsRatio > 1.5) {
+        reasons.push(
+          `smart trail: ignoring ${drawdownFromPeakPct.toFixed(2)}% drop because ` +
+            `buy/sell ratio is strong (${bsRatio.toFixed(2)})`
+        );
+        // Fall through to hold
+      } else {
+        reasons.push(
+          `trailing stop: ${drawdownFromPeakPct.toFixed(2)}% off the peak ` +
+            `(peak +${peakGainPct.toFixed(2)}%, trailing ${TRAIL_PCT}%, ` +
+            `buy/sell ratio ${bsRatio.toFixed(2)} is weak)`
+        );
+        return frozenExit(true, EXIT_REASON.TRAILING_STOP, reasons, false, pnl, peak, 1.0);
+      }
+    }
   }
 
-  // 4. take profit
+  // 5. take profit (hard cap)
   if (pnl >= cfg.takeProfitPct) {
     reasons.push(`take profit: ${pnl.toFixed(2)}% at or above ${cfg.takeProfitPct}%`);
-    return frozenExit(true, EXIT_REASON.TAKE_PROFIT, reasons, false, pnl, peak);
+    return frozenExit(true, EXIT_REASON.TAKE_PROFIT, reasons, false, pnl, peak, 1.0);
   }
 
-  // 5. time stop
+  // 6. time stop
   if (heldMinutes >= cfg.timeStopMinutes) {
     reasons.push(
       `time stop: held ${heldMinutes.toFixed(1)}m at or above ${cfg.timeStopMinutes}m ` +
         `with ${pnl.toFixed(2)}% pnl`,
     );
-    return frozenExit(true, EXIT_REASON.TIME_STOP, reasons, false, pnl, peak);
+    return frozenExit(true, EXIT_REASON.TIME_STOP, reasons, false, pnl, peak, 1.0);
   }
 
-  return frozenExit(false, null, reasons, false, pnl, peak);
+  return frozenExit(false, null, reasons, false, pnl, peak, 1.0);
 }
 
 const pnlPct = (entry, price) => ((price - entry) / entry) * PCT_PER_UNIT;
 
-function frozenExit(exit, reason, reasons, priceUnknown, pnl, peakPriceUsd) {
+function frozenExit(exit, reason, reasons, priceUnknown, pnl, peakPriceUsd, fraction = 1.0) {
   return Object.freeze({
     exit,
     reason,
@@ -556,6 +609,7 @@ function frozenExit(exit, reason, reasons, priceUnknown, pnl, peakPriceUsd) {
     priceUnknown,
     pnlPct: pnl,
     peakPriceUsd,
+    fraction,
   });
 }
 
@@ -664,18 +718,33 @@ export function stepEngine(state, tick) {
     }
     const exitPrice = priceOf.get(mint) ?? position.lastPriceUsd;
     const legs = costs[mint] === undefined ? null : splitLegCosts(costs[mint]);
-    portfolio = closePosition(portfolio, {
-      mint,
-      exitPriceUsd: exitPrice,
-      ts,
-      // No fresh quote for this mint: charge the entry-leg cost again as the exit
-      // leg rather than zero. A free exit is the one thing we know is false.
-      costUsd: legs === null ? position.entryCostUsd : legs.exitUsd,
-      reason: verdict.reason,
-    });
-    delete peaks[mint];
-    closedThisTick.add(mint);
-    actions.push(frozenAction('close', mint, ts, verdict.reasons, { reason: verdict.reason }));
+    const exitCostUsd = legs === null ? position.entryCostUsd : legs.exitUsd;
+
+    if (verdict.fraction < 1.0) {
+      // Partial exit (scale out)
+      portfolio = reducePosition(portfolio, {
+        mint,
+        fraction: verdict.fraction,
+        exitPriceUsd: exitPrice,
+        ts,
+        costUsd: exitCostUsd * verdict.fraction,
+        reason: verdict.reason,
+      });
+      // Do not add to closedThisTick because we are still holding the rest!
+      actions.push(frozenAction('reduce', mint, ts, verdict.reasons, { reason: verdict.reason, fraction: verdict.fraction }));
+    } else {
+      // Full exit
+      portfolio = closePosition(portfolio, {
+        mint,
+        exitPriceUsd: exitPrice,
+        ts,
+        costUsd: exitCostUsd,
+        reason: verdict.reason,
+      });
+      delete peaks[mint];
+      closedThisTick.add(mint);
+      actions.push(frozenAction('close', mint, ts, verdict.reasons, { reason: verdict.reason }));
+    }
   }
 
   // --- 4. kill switch: blocks entries only -----------------------------------

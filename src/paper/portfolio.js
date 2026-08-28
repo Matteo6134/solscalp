@@ -340,6 +340,101 @@ export function closePosition(portfolio, { mint, exitPriceUsd, ts, costUsd, reas
 }
 
 /**
+ * Reduce an open position by a fraction and realise its pnl.
+ * @param {Portfolio} portfolio
+ * @param {object} p
+ * @param {string} p.mint
+ * @param {number} p.fraction     0 to 1 (exclusive, use closePosition for 1)
+ * @param {number} p.exitPriceUsd
+ * @param {number} p.ts
+ * @param {number} p.costUsd
+ * @param {string} p.reason
+ * @returns {Portfolio} a NEW frozen portfolio
+ */
+export function reducePosition(portfolio, { mint, fraction, exitPriceUsd, ts, costUsd, reason }) {
+  const book = assertPortfolio(portfolio, 'reducePosition');
+  assertNonEmptyString(mint, 'mint');
+  assertPositiveNumber(fraction, 'fraction');
+  assertPositiveNumber(exitPriceUsd, 'exitPriceUsd');
+  assertTimestampMs(ts, 'ts');
+  assertNonNegativeNumber(costUsd, 'costUsd');
+  assertNonEmptyString(reason, 'reason');
+
+  if (fraction >= 1) throw new Error('reducePosition: fraction must be < 1, use closePosition for 100%');
+
+  if (!Object.hasOwn(book.positions, mint)) {
+    throw new Error(`reducePosition: no open position for mint ${mint}`);
+  }
+  const position = book.positions[mint];
+  if (ts < position.openedTs) {
+    throw new RangeError(
+      `reducePosition: ts ${ts} precedes openedTs ${position.openedTs} for mint ${mint}`,
+    );
+  }
+
+  const exitQty = position.qty * fraction;
+  const exitSizeUsd = position.sizeUsd * fraction;
+  const exitEntryCostUsd = position.entryCostUsd * fraction;
+  
+  const grossPnlUsd = exitQty * (exitPriceUsd - position.entryPriceUsd);
+  const netPnlUsd = grossPnlUsd - exitEntryCostUsd - costUsd;
+  const isLoss = netPnlUsd < 0;
+  const isWin = netPnlUsd > 0;
+
+  const trade = Object.freeze({
+    mint,
+    sizeUsd: exitSizeUsd,
+    qty: exitQty,
+    entryPriceUsd: position.entryPriceUsd,
+    exitPriceUsd,
+    openedTs: position.openedTs,
+    closedTs: ts,
+    holdMs: ts - position.openedTs,
+    entryCostUsd: exitEntryCostUsd,
+    exitCostUsd: costUsd,
+    totalCostUsd: exitEntryCostUsd + costUsd,
+    grossPnlUsd,
+    netPnlUsd,
+    netPnlPct: (netPnlUsd / exitSizeUsd) * PCT_PER_UNIT,
+    reason,
+    win: isWin,
+  });
+
+  const updatedPosition = Object.freeze({
+    ...position,
+    qty: position.qty - exitQty,
+    sizeUsd: position.sizeUsd - exitSizeUsd,
+    entryCostUsd: position.entryCostUsd - exitEntryCostUsd,
+    lastPriceUsd: exitPriceUsd,
+    lastMarkTs: ts,
+    unrealisedPnlUsd: (position.qty - exitQty) * (exitPriceUsd - position.entryPriceUsd),
+    scaleOutCount: (position.scaleOutCount ?? 0) + 1,
+  });
+
+  const positions = { ...book.positions, [mint]: updatedPosition };
+  const key = dayKey(ts);
+
+  return freezePortfolio({
+    ...book,
+    cashUsd: book.cashUsd + exitSizeUsd + grossPnlUsd - costUsd,
+    costsPaidUsd: book.costsPaidUsd + costUsd,
+    realisedPnlUsd: book.realisedPnlUsd + netPnlUsd,
+    positions,
+    unrealisedPnlUsd: sumUnrealised(positions),
+    closedTrades: [...book.closedTrades, trade],
+    consecutiveLosses: isLoss ? book.consecutiveLosses + 1 : 0,
+    wins: book.wins + (isWin ? 1 : 0),
+    losses: book.losses + (isLoss ? 1 : 0),
+    closedCount: book.closedCount + 1,
+    dailyRealisedPnlUsd: {
+      ...book.dailyRealisedPnlUsd,
+      [key]: (book.dailyRealisedPnlUsd[key] ?? 0) + netPnlUsd,
+    },
+    lastTs: Math.max(book.lastTs, ts),
+  });
+}
+
+/**
  * Re-mark open positions at current prices. Returns a NEW frozen portfolio;
  * marks for a mint we do not hold throw, because a typo that silently leaves a
  * position unmarked understates drawdown.

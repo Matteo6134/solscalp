@@ -77,7 +77,18 @@ export function buildWatchlist(lines) {
       safe: candidates.filter((c) => c.gate?.buyable === true).length,
     });
 
-    for (const c of candidates) {
+    const allPools = [
+      ...candidates,
+      ...(record.scanned ?? []).map((s) => ({
+        mint: s.mint,
+        symbol: s.symbol,
+        liquidityUsd: s.liquidityUsd,
+        marketCapUsd: s.marketCapUsd,
+        gate: { buyable: false, rejectedBy: s.rejectedBy ? [s.rejectedBy] : [] },
+      })),
+    ];
+
+    for (const c of allPools) {
       if (typeof c?.mint !== 'string') continue;
       const existing = rows.get(c.mint);
       if (existing === undefined) {
@@ -99,7 +110,9 @@ export function buildWatchlist(lines) {
       } else {
         existing.seen += 1;
         existing.lastSeenTs = record.ts;
-        existing.series.push({ ts: record.ts, liq: c.liquidityUsd ?? null });
+        if (c.liquidityUsd !== undefined && c.liquidityUsd !== null) {
+          existing.series.push({ ts: record.ts, liq: c.liquidityUsd });
+        }
       }
     }
   }

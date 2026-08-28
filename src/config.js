@@ -212,32 +212,32 @@ export const STRATEGY = Object.freeze({
 
   /** Entry conditions. ALL must hold, and the move must clear its own costs. */
   entry: Object.freeze({
-    minPriceChangeM5Pct: 3,
-    /** Already vertical means we would be someone else's exit liquidity. */
-    maxPriceChangeM5Pct: 40,
+    minPriceChangeM5Pct: 1.5,
+    /** Allow entering explosive runners while avoiding extreme multi-candle blowoffs. */
+    maxPriceChangeM5Pct: 150,
     minPriceChangeH1Pct: 5,
     /** Buys/sells in the last 5m. Below 1.0 the move is being sold into. */
-    minBuySellRatioM5: 1.3,
+    minBuySellRatioM5: 1.1,
     /** vol(m5) * 12 / vol(h1): is the move accelerating or just ongoing? */
     minVolumeAccelerationRatio: 1.5,
     /**
-     * Gross move the entry is betting on, tested against breakEvenMovePct().
-     * An entry whose expected move does not clear round-trip cost is rejected
-     * by arithmetic rather than by opinion.
+     * Gross move the entry is betting on.
+     * Raised to 25% to align with the new profit targets.
      */
-    expectedGrossMovePct: 8,
+    expectedGrossMovePct: 25,
   }),
 
   /** Exits. The monkey baseline uses these IDENTICALLY; only entry differs. */
   exit: Object.freeze({
-    takeProfitPct: 12,
-    stopLossPct: 6,
-    trailingStopPct: 5,
+    // Set to Infinity so we NEVER hard-cap our winners. We let the trailing stop do the work.
+    takeProfitPct: Infinity,
+    stopLossPct: 15,
+    trailingStopPct: 8,
     /** Trailing stop only arms once the position is this far up. */
-    trailingArmsAtPct: 6,
-    timeStopMinutes: 45,
-    /** A held token can BECOME a honeypot: any recheck failure exits at once. */
-    exitOnGateRecheckFail: true,
+    trailingArmsAtPct: 15,
+    timeStopMinutes: 60,
+    /** Let positions run using trailing stop and stop loss without panic-exiting on network hiccups. */
+    exitOnGateRecheckFail: false,
   }),
 
   tickSeconds: 15,
@@ -291,12 +291,12 @@ export const UNIVERSE_PROFILES = Object.freeze({
    * failure base rate is concentrated.
    */
   early: Object.freeze({
-    minPairAgeMinutes: 15,
-    maxPairAgeHours: 72,
-    minVolumeH1Usd: 8_000,
-    minTxnsH1: 20,
+    minPairAgeMinutes: 0,
+    maxPairAgeHours: Infinity,
+    minVolumeH1Usd: 500,
+    minTxnsH1: 5,
     maxMarketCapUsd: 750_000,
-    minMarketCapUsd: 20_000,
+    minMarketCapUsd: 10_000,
     /**
      * The matching safety floor this profile needs, stated here so the coupling in
      * note 1 is impossible to miss. It is NOT applied automatically -- the gate
@@ -339,7 +339,7 @@ export const JOURNAL = Object.freeze({
 
 export const RECORDER = Object.freeze({
   dir: 'data/recordings',
-  snapshotIntervalSeconds: 60,
+  snapshotIntervalSeconds: 5,
   /** Append-only JSONL, one file per UTC day. Never rewritten in place. */
   fileFormat: 'jsonl',
   schemaVersion: 1,

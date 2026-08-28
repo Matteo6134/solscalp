@@ -25,6 +25,8 @@ import { join } from 'node:path';
 import { LABELS, RECORDER } from '../config.js';
 import { getBestPairs } from '../data/dexscreener.js';
 import { LABEL, decideOutcome, shouldRelabel } from './outcome.js';
+import { extractFeatures } from '../ml/features.js';
+import { defaultModel } from '../ml/model.js';
 
 const ISO_DATE_LENGTH = 10;
 
@@ -197,6 +199,32 @@ export async function runLabellingPass(
   };
   const target = join(dir, `${new Date(now).toISOString().slice(0, ISO_DATE_LENGTH)}.jsonl`);
   await append(target, `${JSON.stringify(record)}\n`, 'utf8');
+
+  // --- Online Continuous ML Training ---
+  let trainedCount = 0;
+  for (const d of writable) {
+    if (d.label === 'survived' || d.label === 'rugged') {
+      const obs = d.observation;
+      const features = extractFeatures({
+        pair: {
+          liquidityUsd: obs.liquidityUsd,
+          marketCap: obs.marketCapUsd,
+          ageMinutes: obs.ageMinutes,
+          volumeUsd: { m5: obs.volumeM5Usd, h1: obs.volumeH1Usd },
+          priceChangePct: { m5: obs.priceChangeM5Pct, h1: obs.priceChangeH1Pct },
+          buySellRatioM5: obs.buySellRatioM5,
+        },
+        signals: obs,
+        gateResult: obs.gate ?? {},
+        costBreakdown: obs.roundTrip ?? {},
+      });
+      defaultModel.trainOne(features, d.label === 'survived' ? 1.0 : 0.0);
+      trainedCount++;
+    }
+  }
+  if (trainedCount > 0) {
+    defaultModel.save();
+  }
 
   return summary({
     files: files.length,

@@ -41,14 +41,16 @@ export async function buildDashData({ dir = RECORDER.dir, journalDir = JOURNAL.d
 
   let files = [];
   try {
-    files = (await list(dir)).filter((f) => f.endsWith('.jsonl')).sort();
+    files = (await list(dir)).filter((f) => f.endsWith('.jsonl')).sort().slice(-1);
   } catch {
     /* no directory yet: every field below degrades to empty, which is honest */
   }
   const lines = [];
   for (const file of files) {
     try {
-      lines.push(...(await read(join(dir, file), 'utf8')).split('\n'));
+      const raw = await read(join(dir, file), 'utf8');
+      const allLines = raw.split('\n').filter(Boolean);
+      lines.push(...allLines.slice(-400));
     } catch {
       /* a file that vanished mid-read must not fail the whole screen */
     }
@@ -67,6 +69,12 @@ export async function buildDashData({ dir = RECORDER.dir, journalDir = JOURNAL.d
   const snap = await latestSnapshot({ dir, now }, deps);
   const tally = tallyRecords(lines);
   const report = scoreRugFilter(tally);
+
+  let ml = null;
+  try {
+    const raw = await read(join(process.cwd(), 'data', 'ml_weights.json'), 'utf8');
+    ml = JSON.parse(raw);
+  } catch (e) {}
 
   const history = rows
     .map((r) => {
@@ -101,7 +109,7 @@ export async function buildDashData({ dir = RECORDER.dir, journalDir = JOURNAL.d
         series: Object.freeze(r.series.filter((p) => typeof p.liq === 'number')),
       });
     })
-    .sort((a, b) => (a.changePct ?? 0) - (b.changePct ?? 0));
+    .sort((a, b) => (b.lastSeenTs ?? b.firstTs ?? 0) - (a.lastSeenTs ?? a.firstTs ?? 0));
 
   // A token is in the recording only while it passes the screen, and the feed
   // itself rotates, so the set changes almost every tick: measured over 8
@@ -140,6 +148,72 @@ export async function buildDashData({ dir = RECORDER.dir, journalDir = JOURNAL.d
           })
           .sort((a, b) => b.lastSeenTs - a.lastSeenTs || (a.symbol ?? '').localeCompare(b.symbol ?? ''));
 
+  const uniqueClosedTrades = new Map();
+  for (const t of journal.trades) {
+    uniqueClosedTrades.set(t.mint, t);
+  }
+
+  const snapPairsByMint = new Map((snap.pairs ?? []).map((p) => [p.mint, p]));
+  const historyByMint = new Map(history.map((h) => [h.mint, h]));
+  const heldPositions = Array.isArray(journal.book?.positions)
+    ? journal.book.positions
+    : Object.values(journal.book?.positions ?? {});
+  const heldMints = new Set(heldPositions.map((p) => p.mint));
+
+  const reentry = [...uniqueClosedTrades.values()]
+    .map((t) => {
+      const pair = snapPairsByMint.get(t.mint);
+      const hist = historyByMint.get(t.mint);
+      const livePrice = pair?.priceUsd ? Number(pair.priceUsd) : (hist?.entryPriceUsd ?? t.exitPriceUsd);
+      const dipPct =
+        livePrice && t.exitPriceUsd
+          ? ((livePrice - t.exitPriceUsd) / t.exitPriceUsd) * 100
+          : null;
+      const m5Change = pair?.priceChange?.m5 !== undefined ? Number(pair.priceChange.m5) : null;
+      const h1Change = pair?.priceChange?.h1 !== undefined ? Number(pair.priceChange.h1) : null;
+      const buys = pair?.txns?.m5?.buys;
+      const sells = pair?.txns?.m5?.sells;
+      const buySellRatio = buys !== undefined && sells !== undefined ? buys / Math.max(1, sells) : null;
+      const gate = snap.gateResults?.[t.mint];
+      const gateBuyable = gate ? gate.buyable === true : hist?.gateBuyable ?? null;
+      const isHolding = heldMints.has(t.mint);
+
+      let status = 'WATCHING';
+      let statusColor = 'gray';
+      if (isHolding) {
+        status = 'HOLDING';
+        statusColor = 'cyan';
+      } else if (gateBuyable === false) {
+        status = 'BLOCKED';
+        statusColor = 'red';
+      } else if (m5Change !== null && m5Change >= 1.5 && (buySellRatio === null || buySellRatio >= 1.1)) {
+        status = 'READY';
+        statusColor = 'green';
+      } else if (dipPct !== null && dipPct < 0) {
+        status = 'DIP';
+        statusColor = 'yellow';
+      }
+
+      return Object.freeze({
+        mint: t.mint,
+        symbol: t.symbol ?? hist?.symbol ?? t.mint.slice(0, 8),
+        exitPriceUsd: t.exitPriceUsd,
+        livePriceUsd: livePrice,
+        dipPct,
+        m5Change,
+        h1Change,
+        buySellRatio,
+        exitReason: t.reason,
+        closedTs: t.closedTs ?? t.ts,
+        holdMs: t.holdMs,
+        gateBuyable,
+        status,
+        statusColor,
+        isHolding,
+      });
+    })
+    .sort((a, b) => (b.closedTs ?? 0) - (a.closedTs ?? 0));
+
   return Object.freeze({
     generatedAt: now,
     recorder: Object.freeze({
@@ -149,6 +223,7 @@ export async function buildDashData({ dir = RECORDER.dir, journalDir = JOURNAL.d
       profile: snap.profile,
       fileCount: files.length,
     }),
+    reentry: Object.freeze(reentry),
     ticks,
     recent: Object.freeze(recent),
     // The full sweep of the newest tick, rejects included, each with the FIRST
@@ -196,6 +271,7 @@ export async function buildDashData({ dir = RECORDER.dir, journalDir = JOURNAL.d
       report,
       baseRatePct: BASE_RATE_PCT,
       minSample: MIN_SAMPLE,
+      ml,
     }),
     config: Object.freeze({
       bookSizeUsd: RISK.bookSizeUsd,
@@ -231,6 +307,7 @@ export const EMPTY = Object.freeze({
   scanned: Object.freeze([]),
   lastScan: Object.freeze([]),
   history: Object.freeze([]),
+  reentry: Object.freeze([]),
   paper: Object.freeze({
     hasBook: false,
     book: null,

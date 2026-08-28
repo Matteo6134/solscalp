@@ -146,23 +146,20 @@ describe('buildDashData', () => {
     await expect(buildDashData({ now: TS }, fs)).resolves.toBeDefined();
   });
 
-  it('sorts history worst-first, so the collapses are visible immediately', async () => {
+  it('sorts history newest-first, so the newest tokens are visible immediately', async () => {
     const fs = fakeFs({
       '2026-08-26.jsonl': [
         snapshot([
-          candidate({ mint: 'AAA', symbol: 'UP', liquidityUsd: 10_000 }),
-          candidate({ mint: 'BBB', symbol: 'DOWN', liquidityUsd: 100_000 }),
+          candidate({ mint: 'AAA', symbol: 'EARLIER', liquidityUsd: 10_000 }),
         ], TS - 100_000),
         snapshot([
-          candidate({ mint: 'AAA', symbol: 'UP', liquidityUsd: 20_000 }),
-          candidate({ mint: 'BBB', symbol: 'DOWN', liquidityUsd: 5_000 }),
+          candidate({ mint: 'BBB', symbol: 'NEWEST', liquidityUsd: 5_000 }),
         ], TS),
       ].join('\n') + '\n',
     });
     const d = await buildDashData({ now: TS }, fs);
 
-    expect(d.history[0].symbol).toBe('DOWN');
-    expect(d.history[0].changePct).toBeLessThan(0);
+    expect(d.history[0].symbol).toBe('NEWEST');
   });
 
   it('EMPTY is a usable first frame', () => {

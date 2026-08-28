@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "totalUpdates": 9065,
+  "sampleCount": 300,
+  "accuracyPct": 78.67,
+  "avgLoss": 0.4516,
+  "bias": -0.5738337169232026,
+  "weights": [
+    1.4773923490853935,
+    0.3878326834729362,
+    -0.3765036668957628,
+    4.462147465453583,
+    -0.643876606787418,
+    -3.018315531953886,
+    0.09601591519896324,
+    -2.1652720378299186,
+    -0.08661036143814416,
+    0.10144200548536761,
+    -0.19815309731085923,
+    -1.1583569927196125
+  ],
+  "featureNames": [
+    "log_liquidity",
+    "log_market_cap",
+    "liq_to_mc_ratio",
+    "log_age_minutes",
+    "log_vol_m5",
+    "log_vol_h1",
+    "vol_acceleration",
+    "buy_sell_ratio_m5",
+    "price_change_m5",
+    "price_change_h1",
+    "gate_buyable",
+    "slippage_impact_pct"
+  ],
+  "savedAt": "2026-08-28T13:36:49.047Z"
+}
