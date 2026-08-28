@@ -173,6 +173,69 @@ export function emptyPortfolio({ bookSizeUsd = RISK.bookSizeUsd } = {}) {
 }
 
 /**
+ * Restores an existing portfolio from disk, preserving all profits, wins and positions.
+ * @param {object} [p]
+ * @param {object} [p.book]
+ * @param {readonly object[]} [p.trades]
+ * @param {number} [p.bookSizeUsd]
+ * @returns {Portfolio}
+ */
+export function restorePortfolio({ book, trades = [], bookSizeUsd = RISK.bookSizeUsd } = {}) {
+  if (!book && (!Array.isArray(trades) || trades.length === 0)) {
+    return emptyPortfolio({ bookSizeUsd });
+  }
+
+  const positionsMap = {};
+  if (Array.isArray(book?.positions)) {
+    for (const p of book.positions) {
+      if (p.mint) positionsMap[p.mint] = p;
+    }
+  } else if (book?.positions && typeof book.positions === 'object') {
+    Object.assign(positionsMap, book.positions);
+  }
+
+  const closedTrades = Array.isArray(trades) && trades.length > 0
+    ? trades
+    : (Array.isArray(book?.closedTrades) ? book.closedTrades : []);
+
+  const realisedPnlUsd = typeof book?.realisedPnlUsd === 'number'
+    ? book.realisedPnlUsd
+    : closedTrades.reduce((sum, t) => sum + (t.netPnlUsd ?? 0), 0);
+
+  const wins = typeof book?.wins === 'number'
+    ? book.wins
+    : closedTrades.filter((t) => (t.netPnlUsd ?? 0) > 0).length;
+
+  const losses = typeof book?.losses === 'number'
+    ? book.losses
+    : closedTrades.filter((t) => (t.netPnlUsd ?? 0) <= 0).length;
+
+  const cashUsd = typeof book?.cashUsd === 'number'
+    ? book.cashUsd
+    : (bookSizeUsd + realisedPnlUsd);
+
+  return freezePortfolio({
+    bookSizeUsd,
+    cashUsd,
+    positions: positionsMap,
+    closedTrades,
+    realisedPnlUsd,
+    unrealisedPnlUsd: typeof book?.unrealisedPnlUsd === 'number' ? book.unrealisedPnlUsd : 0,
+    costsPaidUsd: typeof book?.costsPaidUsd === 'number' ? book.costsPaidUsd : 0,
+    grossSpentUsd: typeof book?.grossSpentUsd === 'number' ? book.grossSpentUsd : 0,
+    consecutiveLosses: typeof book?.consecutiveLosses === 'number' ? book.consecutiveLosses : 0,
+    wins,
+    losses,
+    openedCount: typeof book?.openedCount === 'number'
+      ? book.openedCount
+      : (Object.keys(positionsMap).length + closedTrades.length),
+    closedCount: typeof book?.closedCount === 'number' ? book.closedCount : closedTrades.length,
+    dailyRealisedPnlUsd: book?.dailyRealisedPnlUsd ?? {},
+    lastTs: book?.ts ?? Date.now(),
+  });
+}
+
+/**
  * Open a paper position.
  *
  * costUsd is the cost attributed to THIS leg only -- pass the entry share of

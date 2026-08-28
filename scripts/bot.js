@@ -58,7 +58,7 @@ import {
   stepEngine,
   universeReasons,
 } from '../src/paper/engine.js';
-import { emptyPortfolio, portfolioEquityUsd } from '../src/paper/portfolio.js';
+import { emptyPortfolio, restorePortfolio, portfolioEquityUsd } from '../src/paper/portfolio.js';
 import {
   appendJournal,
   buildBookRecord,
@@ -208,12 +208,34 @@ export async function main(argv, injected = {}) {
   const limit = intFlag(flags.limit, 8);
   const startedAt = deps.now();
 
+  // RESTORE EXISTING PORTFOLIO FROM DISK SO PROFITS AND WINS ARE NEVER WIPED!
+  let initialPortfolio = emptyPortfolio({});
+  if (paperEnabled) {
+    try {
+      const existingJournal = await loadJournal({ dir: paperDir }, deps);
+      if (existingJournal.book || (Array.isArray(existingJournal.trades) && existingJournal.trades.length > 0)) {
+        initialPortfolio = restorePortfolio({
+          book: existingJournal.book,
+          trades: existingJournal.trades,
+        });
+        say(
+          `[journal] restored portfolio from disk: equity $${initialPortfolio.cashUsd.toFixed(2)}, ` +
+            `realised P&L $${initialPortfolio.realisedPnlUsd.toFixed(2)}, ` +
+            `${initialPortfolio.wins}W/${initialPortfolio.losses}L, ` +
+            `${Object.keys(initialPortfolio.positions).length} open positions`,
+        );
+      }
+    } catch (err) {
+      say(`[journal] could not restore portfolio: ${describeError(err)}`);
+    }
+  }
+
   const state = {
     cycle: 0,
     alertsPaused: false,
     lastRecheckAt: 0,
     updateOffset: 0,
-    engine: createEngineState({ portfolio: emptyPortfolio({}) }),
+    engine: createEngineState({ portfolio: initialPortfolio }),
     candidates: [],
     funnel: { pools: 0, pairs: 0, screened: 0, gated: 0, safe: 0, wouldEnter: 0 },
   };
@@ -223,18 +245,6 @@ export async function main(argv, injected = {}) {
   out('Ctrl+C to stop. Alerts go to the configured chat only.');
   await notifier.send('🤖 <b>SOLSCALP started</b>\n<i>paper only</i>', { force: true });
 
-  // PUBLISH A BOOK AT STARTUP, EVEN THOUGH IT IS EMPTY.
-  //
-  // The journal's newest book line is what every reader treats as "now". A fresh
-  // process starts flat, and publishing only on CHANGE meant it published
-  // nothing -- so the dashboard went on showing the PREVIOUS process's book as
-  // current. Observed immediately after a restart: an open position with a mark
-  // 3600 seconds old, presented as live, belonging to a bot that no longer
-  // existed.
-  //
-  // One line here makes the journal reflect the running bot from its first
-  // moment. Closed trades are unaffected: those are their own append-only lines
-  // and no restart touches them.
   if (paperEnabled) {
     try {
       await appendJournal(
