@@ -112,8 +112,8 @@ export const SAFETY = Object.freeze({
 /** Position sizing and loss limits. Book is ~200-500 EUR. */
 export const RISK = Object.freeze({
   bookSizeUsd: 450,
-  positionSizeUsd: 40,
-  maxConcurrentPositions: 8,
+  positionSizeUsd: 100,
+  maxConcurrentPositions: 4,
   maxDailyLossPct: 15,
   killSwitchConsecutiveLosses: 6,
   /** Hard ceiling on total SOL the bot may ever spend, regardless of logic. */
