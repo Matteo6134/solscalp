@@ -47,6 +47,8 @@ import { describeValue, requireHttpUrl } from './rpc/rpc-validate.js';
 export const ENV_VARS = Object.freeze({
   rpcUrl: 'SOLANA_RPC_URL',
   rpcFallbackUrl: 'SOLANA_RPC_URL_FALLBACK',
+  grpcUrl: 'SOLANA_GRPC_URL',
+  grpcToken: 'SOLANA_GRPC_TOKEN',
   mode: 'MODE',
   allowLive: 'SOLSCALP_ALLOW_LIVE',
   telegramBotToken: 'TELEGRAM_BOT_TOKEN',
@@ -355,16 +357,17 @@ export function loadEnv(source, deps = {}) {
   const mode = readMode(env);
   const rpcUrl = readRpcUrl(env, warn);
   const rpcFallbackUrl = readRpcFallbackUrl(env);
+  const grpcUrl = readOptional(env, ENV_VARS.grpcUrl);
+  const grpcToken = readOptional(env, ENV_VARS.grpcToken);
   const telegram = readTelegram(env, warn);
 
   return Object.freeze({
     rpcUrl,
     rpcFallbackUrl,
+    grpcUrl,
+    grpcToken,
     mode,
     telegram,
-    // Structurally `false`, not computed: `readMode` throws on `live`, so there
-    // is no execution path in which this could be true. Callers may assert on it
-    // as a cheap, permanent invariant.
     isLive: false,
   });
 }
