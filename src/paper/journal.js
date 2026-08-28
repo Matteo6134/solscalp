@@ -295,6 +295,34 @@ export function readJournal(lines) {
     );
   }
 
+  if (book !== null && trades.length > 0) {
+    const totalTradePnl = trades.reduce((sum, t) => sum + (t.netPnlUsd ?? 0), 0);
+    const winCount = trades.filter((t) => (t.netPnlUsd ?? 0) > 0).length;
+    const lossCount = trades.filter((t) => (t.netPnlUsd ?? 0) <= 0).length;
+
+    const baseBookSize = book.bookSizeUsd ?? 450;
+    const realised = typeof book.realisedPnlUsd === 'number' && book.realisedPnlUsd !== 0
+      ? book.realisedPnlUsd
+      : totalTradePnl;
+    const unrealised = book.unrealisedPnlUsd ?? 0;
+    const cash = typeof book.cashUsd === 'number' && book.cashUsd !== baseBookSize
+      ? book.cashUsd
+      : (baseBookSize + realised);
+    const equity = typeof book.equityUsd === 'number' && book.equityUsd !== baseBookSize
+      ? book.equityUsd
+      : (cash + unrealised);
+
+    book = {
+      ...book,
+      realisedPnlUsd: realised,
+      equityUsd: equity,
+      cashUsd: cash,
+      wins: typeof book.wins === 'number' && book.wins !== 0 ? book.wins : winCount,
+      losses: typeof book.losses === 'number' && book.losses !== 0 ? book.losses : lossCount,
+      closedCount: Math.max(book.closedCount ?? 0, trades.length),
+    };
+  }
+
   return Object.freeze({
     book,
     trades: Object.freeze(trades),

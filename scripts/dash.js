@@ -2186,12 +2186,29 @@ const Body = memo(function Body({
       { gap: 2, height: CHROME.footer, overflow: 'hidden' },
       (() => {
         const book = data.paper?.book;
-        const equity = typeof book?.equityUsd === 'number' ? book.equityUsd : (data.config.bookSizeUsd ?? 450);
-        const cash = typeof book?.cashUsd === 'number' ? book.cashUsd : equity;
-        const pnl = typeof book?.realisedPnlUsd === 'number' ? book.realisedPnlUsd + (book.unrealisedPnlUsd ?? 0) : 0;
-        const wins = book?.wins ?? 0;
-        const losses = book?.losses ?? 0;
-        const posCount = Array.isArray(book?.positions) ? book.positions.length : Object.keys(book?.positions ?? {}).length;
+        const trades = data.paper?.trades ?? [];
+        const tradePnl = trades.reduce((sum, t) => sum + (t.netPnlUsd ?? 0), 0);
+        const winCount = trades.filter((t) => (t.netPnlUsd ?? 0) > 0).length;
+        const lossCount = trades.filter((t) => (t.netPnlUsd ?? 0) <= 0).length;
+
+        const baseBookSize = data.config.bookSizeUsd ?? 450;
+        const realised = typeof book?.realisedPnlUsd === 'number' && book.realisedPnlUsd !== 0
+          ? book.realisedPnlUsd
+          : tradePnl;
+        const unrealised = book?.unrealisedPnlUsd ?? 0;
+        const pnl = realised + unrealised;
+        const wins = typeof book?.wins === 'number' && book.wins !== 0 ? book.wins : winCount;
+        const losses = typeof book?.losses === 'number' && book.losses !== 0 ? book.losses : lossCount;
+        const cash = typeof book?.cashUsd === 'number' && book.cashUsd !== baseBookSize
+          ? book.cashUsd
+          : (baseBookSize + realised);
+        const equity = typeof book?.equityUsd === 'number' && book.equityUsd !== baseBookSize
+          ? book.equityUsd
+          : (cash + unrealised);
+
+        const posCount = Array.isArray(book?.positions)
+          ? book.positions.length
+          : Object.keys(book?.positions ?? {}).length;
         const pnlColor = pnl > 0 ? 'green' : pnl < 0 ? 'red' : undefined;
 
         return h(
@@ -2238,7 +2255,7 @@ export async function main(argv, deps = {}) {
       h(Box, { flexDirection: 'column' }, h(App, { dir, journalDir, refreshMs: 1e9, initialView, cols, openDetail, initialWindow })),
       { patchConsole: false },
     );
-    await new Promise((r) => setTimeout(r, 400));
+    await new Promise((r) => setTimeout(r, 800));
     app.unmount();
     return EXIT.OK;
   }
