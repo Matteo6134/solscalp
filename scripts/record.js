@@ -37,7 +37,7 @@ import { costsFor, solPriceFrom } from './lib/liveCosts.js';
 import { runGate } from '../src/safety/index.js';
 import { EXIT, buildRpc, intFlag, isMain, parseArgs, runMain, say } from './lib/cli.js';
 
-const GATE_CONCURRENCY = 3;
+const GATE_CONCURRENCY = 5;
 const MS_PER_SECOND = 1_000;
 const ISO_DATE_LENGTH = 10;
 /** Ceiling on the scan feed per tick, so a huge trending page cannot bloat a day's file. */

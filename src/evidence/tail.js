@@ -202,7 +202,7 @@ function empty(fileCount) {
  * @param {number} expectedIntervalSeconds
  * @param {number} [toleranceMultiple] how many missed ticks before we call it stale
  */
-export function isRecorderHealthy(snapshotAgeMs, expectedIntervalSeconds, toleranceMultiple = 4) {
+export function isRecorderHealthy(snapshotAgeMs, expectedIntervalSeconds, toleranceMultiple = 10) {
   if (snapshotAgeMs === null) return false;
   return snapshotAgeMs <= expectedIntervalSeconds * 1_000 * toleranceMultiple;
 }
