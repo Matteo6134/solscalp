@@ -69,7 +69,7 @@ function Start-Solscalp {
   # capture is exactly what proved unreliable here.
   $env:SOLSCALP_LOG_FILE = "data/$Name.log"
   $proc = Start-Process -FilePath 'node' `
-    -ArgumentList (@($Script) + $ScriptArgs) `
+    -ArgumentList (@('--max-old-space-size=4096', '--expose-gc', $Script) + $ScriptArgs) `
     -WorkingDirectory $root `
     -RedirectStandardOutput "data\$Name.out" `
     -RedirectStandardError  "data\$Name.err" `

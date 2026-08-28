@@ -15,7 +15,7 @@
  *   the usual cause of a stuck terminal dashboard simply is not present.
  */
 
-import { readdir, readFile } from 'node:fs/promises';
+import { readdir, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { JOURNAL, LABELS, RECORDER, RISK, STRATEGY } from '../../src/config.js';
 import { LABEL } from '../../src/evidence/outcome.js';
@@ -28,16 +28,29 @@ const MS_PER_HOUR = 3_600_000;
 /** How many recorder ticks a departed token stays visible for. */
 export const RECENT_WINDOW_TICKS = 10;
 
+/** In-memory cache for recorded lines and watchlist to prevent 50MB re-parsing every 3s */
+let cachedRecordingState = {
+  file: '',
+  size: 0,
+  mtimeMs: 0,
+  lines: [],
+  rows: [],
+  ticks: [],
+  tally: null,
+  report: null,
+};
+
 /**
  * @param {object} [p]
  * @param {string} [p.dir]
  * @param {number} [p.now]
- * @param {object} [deps] `readdir` / `readFile` seams
+ * @param {object} [deps] `readdir` / `readFile` / `stat` seams
  * @returns {Promise<Readonly<object>>} frozen payload
  */
 export async function buildDashData({ dir = RECORDER.dir, journalDir = JOURNAL.dir, now = Date.now() } = {}, deps = {}) {
   const list = deps.readdir ?? readdir;
   const read = deps.readFile ?? readFile;
+  const getStat = deps.stat ?? stat;
 
   let files = [];
   try {
@@ -45,30 +58,64 @@ export async function buildDashData({ dir = RECORDER.dir, journalDir = JOURNAL.d
   } catch {
     /* no directory yet: every field below degrades to empty, which is honest */
   }
-  const lines = [];
-  for (const file of files) {
+
+  let lines = [];
+  let rows = [];
+  let ticks = [];
+  let tally = null;
+  let report = null;
+
+  if (files.length > 0) {
+    const file = files[0];
+    const fullPath = join(dir, file);
     try {
-      const raw = await read(join(dir, file), 'utf8');
-      const allLines = raw.split('\n').filter(Boolean);
-      lines.push(...allLines);
+      const fileStat = await getStat(fullPath);
+      if (
+        cachedRecordingState.file === file &&
+        cachedRecordingState.size === fileStat.size &&
+        cachedRecordingState.mtimeMs === fileStat.mtimeMs &&
+        cachedRecordingState.rows.length > 0
+      ) {
+        // Reuse cached computation instantly with 0 memory allocation
+        lines = cachedRecordingState.lines;
+        rows = cachedRecordingState.rows;
+        ticks = cachedRecordingState.ticks;
+        tally = cachedRecordingState.tally;
+        report = cachedRecordingState.report;
+      } else {
+        const raw = await read(fullPath, 'utf8');
+        lines = raw.split('\n').filter(Boolean);
+        const wl = buildWatchlist(lines);
+        rows = wl.rows;
+        ticks = wl.ticks;
+        tally = tallyRecords(lines);
+        report = scoreRugFilter(tally);
+
+        cachedRecordingState = {
+          file,
+          size: fileStat.size,
+          mtimeMs: fileStat.mtimeMs,
+          lines,
+          rows,
+          ticks,
+          tally,
+          report,
+        };
+      }
     } catch {
       /* a file that vanished mid-read must not fail the whole screen */
     }
+  } else {
+    const wl = buildWatchlist([]);
+    rows = wl.rows;
+    ticks = wl.ticks;
+    tally = tallyRecords([]);
+    report = scoreRugFilter(tally);
   }
 
   // The BOT's book, read rather than re-derived.
-  //
-  // This screen used to show no positions at all while Telegram showed open
-  // trades and a running loss, because the bot held its portfolio only in memory
-  // and this process had no way to see it. Two sources of truth, guaranteed to
-  // disagree. Now the bot publishes and this reads: whatever the numbers are,
-  // both screens quote the same ones.
   const journal = await loadJournal({ dir: journalDir }, deps);
-
-  const { rows, ticks } = buildWatchlist(lines);
   const snap = await latestSnapshot({ dir, now }, deps);
-  const tally = tallyRecords(lines);
-  const report = scoreRugFilter(tally);
 
   let ml = null;
   try {
