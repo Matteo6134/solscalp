@@ -46,6 +46,9 @@ import {
   formatStatus,
 } from '../src/notify/format.js';
 import { buildDashData } from './lib/dashData.js';
+import { getTradingMode, MODES as TRADE_MODES } from '../src/trade/modeManager.js';
+import { loadWallet, getWalletBalance } from '../src/trade/wallet.js';
+import { executeBuyOrder, executeSellOrder } from '../src/trade/executor.js';
 import { isRecorderHealthy, latestSnapshot } from '../src/evidence/tail.js';
 import { createNotifier } from '../src/notify/telegram.js';
 import {
@@ -636,6 +639,33 @@ export async function publishBook({ state, before, symbolOf, pools = {}, at, dir
 /** Turn engine actions into alerts. */
 async function announceActions({ state, notifier, before, symbolOf, at }) {
   if (state.alertsPaused) return;
+
+  const mode = getTradingMode();
+  if (mode === TRADE_MODES.REAL) {
+    const wallet = loadWallet();
+    if (wallet) {
+      for (const action of state.engine.actions ?? []) {
+        if (action.kind === 'open') {
+          say(`[live] EXECUTING REAL ON-CHAIN BUY: ${symbolOf.get(action.mint)} ($${action.sizeUsd})`);
+          const solAmount = (action.sizeUsd ?? 100) / 150;
+          executeBuyOrder({ wallet, mint: action.mint, amountSol: solAmount })
+            .then((res) => {
+              if (res.success) {
+                say(`[live] BUY CONFIRMED ON-CHAIN! Signature: ${res.signature}`);
+                notifier.send(
+                  `🚀 <b>REAL ON-CHAIN BUY CONFIRMED</b>\n<b>${symbolOf.get(action.mint) ?? 'Token'}</b>\n<code>${action.mint}</code>\n<a href="https://solscan.io/tx/${res.signature}">View on Solscan</a>`,
+                  { force: true },
+                );
+              } else {
+                say(`[live] BUY FAILED: ${res.error}`);
+              }
+            })
+            .catch((err) => say(`[live] Execution error: ${err.message}`));
+        }
+      }
+    }
+  }
+
   for (const action of state.engine.actions ?? []) {
     if (action.kind === 'open' && NOTIFY.events.positionOpened) {
       await notifier.send(
@@ -675,6 +705,15 @@ async function handleCommand(command, { state, notifier, deps, feed, universe, s
     case 'start':
     case 'help':
       return reply(formatHelp());
+    case 'mode': {
+      const mode = getTradingMode();
+      const wallet = loadWallet();
+      return reply(
+        `⚙️ <b>CURRENT TRADING MODE:</b> ${mode === 'real' ? '🔴 <b>REAL LIVE</b>' : '🟡 <b>PAPER SIMULATION</b>'}\n\n` +
+        `• <b>Wallet:</b> <code>${wallet ? wallet.address : 'None (.env not set)'}</code>\n` +
+        `• <i>To switch modes, press [M] in your terminal dashboard (npm run dash)</i>`
+      );
+    }
     case 'status': {
       // Read the journal from disk so /status shows the SAME data as the
       // dashboard, surviving restarts. The in-memory portfolio resets on every

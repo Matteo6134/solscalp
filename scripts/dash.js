@@ -66,6 +66,8 @@ import { JOURNAL, RECORDER } from '../src/config.js';
 import { getBestPair } from '../src/data/dexscreener.js';
 import { EMPTY, buildDashData } from './lib/dashData.js';
 import { EXIT, intFlag, isMain, parseArgs, runMain } from './lib/cli.js';
+import { getTradingMode, setTradingMode, MODES } from '../src/trade/modeManager.js';
+import { loadWallet, getWalletBalance } from '../src/trade/wallet.js';
 
 const MS_PER_SECOND = 1_000;
 const VIEWS = Object.freeze(['live', 'positions', 'history', 'evidence', 'reentry']);
@@ -1725,6 +1727,33 @@ export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail 
   // time -- correctly, since the recorder writes once a minute -- so the key
   // looked broken. It was not: verified reads 1 -> 2 with a synthetic terminal.
   // What was missing was any sign it had happened.
+  const [mode, setMode] = useState(() => getTradingMode());
+  const [walletState, setWalletState] = useState(null);
+  const [confirmingLive, setConfirmingLive] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    const checkWallet = async () => {
+      try {
+        const w = loadWallet();
+        if (!w) {
+          if (active) setWalletState(null);
+          return;
+        }
+        const bal = await getWalletBalance(w);
+        if (active) setWalletState({ address: w.address, sol: bal.sol });
+      } catch {
+        if (active) setWalletState(null);
+      }
+    };
+    checkWallet();
+    const t = setInterval(checkWallet, 10_000);
+    return () => {
+      active = false;
+      clearInterval(t);
+    };
+  }, [mode]);
+
   const [flash, setFlash] = useState(null);
   const [rescanned, setRescanned] = useState(new Map());
   // What the last accepted payload looked like. A ref, not state: changing it
@@ -1835,6 +1864,27 @@ export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail 
       const move = (delta) =>
         setCursor((c) => ({ ...c, [view]: Math.max(0, Math.min(last, (c[view] ?? 0) + delta)) }));
 
+      // CONFIRMATION DIALOG FOR REAL LIVE TRADING
+      if (confirmingLive) {
+        if (input === 'y' || input === 'Y') {
+          if (!walletState?.address) {
+            setFlash({ text: '❌ Cannot switch: No SOLANA_PRIVATE_KEY in .env!' });
+            setConfirmingLive(false);
+          } else {
+            setTradingMode(MODES.REAL);
+            setMode(MODES.REAL);
+            setConfirmingLive(false);
+            setFlash({
+              text: `🔴 REAL LIVE ACTIVE: Wallet ${walletState.address.slice(0, 6)}... (${walletState.sol.toFixed(2)} SOL)`,
+            });
+          }
+        } else if (key.escape || input === 'n' || input === 'N' || (key.ctrl && input === 'c')) {
+          setConfirmingLive(false);
+          setFlash({ text: '🟡 Switch cancelled: Remained in PAPER simulation.' });
+        }
+        return;
+      }
+
       // SEARCH MODE SWALLOWS EVERYTHING. Otherwise typing a token name would
       // quit on the 'q' and change view on any digit -- the classic way a search
       // box in a key-driven interface becomes unusable.
@@ -1864,6 +1914,15 @@ export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail 
       else if (input === '3') setView(VIEWS[2]);
       else if (input === '4') setView(VIEWS[3]);
       else if (input === '5') setView(VIEWS[4]);
+      else if (input === 'm' || input === 'M') {
+        if (mode === MODES.PAPER) {
+          setConfirmingLive(true);
+        } else {
+          setTradingMode(MODES.PAPER);
+          setMode(MODES.PAPER);
+          setFlash({ text: '🟡 SWITCHED TO PAPER TRADING (Safe Simulation Active)' });
+        }
+      }
       else if (input === 'r') {
         setNudge((n) => n + 1);
         setFlash({ was: data.generatedAt });
@@ -1983,21 +2042,38 @@ export function App({ dir, journalDir, refreshMs, initialView, cols, openDetail 
       { gap: 2, height: CHROME.header, overflow: 'hidden' },
       h(Text, { bold: true }, 'SOLSCALP'),
       h(Text, { color: data.recorder.healthy ? 'cyan' : 'red', bold: true }, spin),
-      status,
-      flash !== null
+      confirmingLive
         ? h(
             Text,
-            { color: flash.text ? 'green' : 'cyan', bold: true },
-            flash.text ?? (data.generatedAt === flash.was ? 're-read · nothing new' : 're-read · updated'),
+            { color: 'red', bold: true, inverse: true },
+            `⚠️ SWITCH TO REAL LIVE TRADING? (${walletState?.address ? walletState.address.slice(0, 6) + '...' : 'NO WALLET'} · ${walletState?.sol?.toFixed(2) ?? '0.00'} SOL) — Press [Y] to CONFIRM, [N] to Cancel`,
           )
-        : heapMb >= HEAP_WARN_MB
-        ? h(
+        : h(
             Text,
-            { color: heapMb >= HEAP_URGENT_MB ? 'red' : 'yellow', bold: true },
-            `memory ${(heapMb / 1024).toFixed(1)}GB — ` +
-              (heapMb >= HEAP_URGENT_MB ? 'RESTART NOW (q, then npm run dash)' : 'restart me soon'),
-          )
-        : h(Text, { dimColor: true }, `profile ${data.recorder.profile ?? '?'} · reads ${reads}`),
+            {
+              color: mode === 'real' ? 'red' : 'yellow',
+              bold: true,
+              inverse: mode === 'real',
+            },
+            `[M] ${mode === 'real' ? '🔴 REAL LIVE' : '🟡 PAPER'}` +
+              (walletState ? ` (${walletState.sol.toFixed(2)} SOL)` : ''),
+          ),
+      !confirmingLive && status,
+      !confirmingLive &&
+        (flash !== null
+          ? h(
+              Text,
+              { color: flash.text ? 'green' : 'cyan', bold: true },
+              flash.text ?? (data.generatedAt === flash.was ? 're-read · nothing new' : 're-read · updated'),
+            )
+          : heapMb >= HEAP_WARN_MB
+            ? h(
+                Text,
+                { color: heapMb >= HEAP_URGENT_MB ? 'red' : 'yellow', bold: true },
+                `memory ${(heapMb / 1024).toFixed(1)}GB — ` +
+                  (heapMb >= HEAP_URGENT_MB ? 'RESTART NOW (q, then npm run dash)' : 'restart me soon'),
+              )
+            : h(Text, { dimColor: true }, `profile ${data.recorder.profile ?? '?'} · reads ${reads}`)),
     ),
     h(Body, {
       data,
@@ -2072,7 +2148,7 @@ const Body = memo(function Body({
         ? h(
             Text,
             { dimColor: true },
-            '· arrows · enter details · / search · g group · s rescan · t timeframe · r reload · q quit',
+            '· arrows · enter details · m mode switch · / search · g group · s rescan · t timeframe · r reload · q quit',
           )
         : h(Text, { color: 'yellow' }, '· no keys here: use --view'),
     ),
