@@ -1,7 +1,7 @@
 import { VersionedTransaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { fetch } from 'undici';
 import { ENDPOINTS, KNOWN } from '../config.js';
-import { sendJitoBundle } from '../rpc/jito.js';
+import { broadcastJitoBundle, checkBundleStatus, getEscalatedTipLamports } from '../rpc/jito.js';
 
 const JUPITER_API = ENDPOINTS.jupiterQuote;
 
@@ -69,45 +69,81 @@ export async function buildSwapTransaction({ wallet, quoteResponse }) {
 }
 
 /**
- * Sends a signed transaction and waits for confirmation.
+ * Sends a signed transaction and waits for confirmation with Jito tip escalation and resilient retries.
  * @param {object} p
  * @param {VersionedTransaction} p.tx
  * @param {object} p.wallet
  * @param {boolean} [p.useJito=false]
- * @returns {Promise<{ success: boolean, signature?: string, error?: string }>}
+ * @param {number} [p.maxAttempts=3]
+ * @param {boolean} [p.isEmergencyExit=false]
+ * @returns {Promise<{ success: boolean, signature?: string, error?: string, method?: string, attempt?: number }>}
  */
-export async function sendAndConfirmSwap({ tx, wallet, useJito = false }) {
-  try {
-    const raw = tx.serialize();
+export async function sendAndConfirmSwap({
+  tx,
+  wallet,
+  useJito = false,
+  maxAttempts = 3,
+  isEmergencyExit = false,
+}) {
+  let lastError = null;
 
-    if (useJito) {
-      const jitoRes = await sendJitoBundle([tx]);
-      if (jitoRes?.bundleId) {
-        return { success: true, signature: jitoRes.bundleId, method: 'jito' };
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const raw = tx.serialize();
+
+      if (useJito) {
+        try {
+          const jitoRes = await broadcastJitoBundle([tx]);
+          if (jitoRes?.bundleId) {
+            for (let i = 0; i < 3; i++) {
+              await new Promise((r) => setTimeout(r, 600));
+              const status = await checkBundleStatus(jitoRes.bundleId);
+              if (status.landed) {
+                return {
+                  success: true,
+                  signature: jitoRes.bundleId,
+                  method: 'jito',
+                  engine: jitoRes.engine,
+                  attempt,
+                };
+              }
+            }
+          }
+        } catch (jitoErr) {
+          lastError = jitoErr.message;
+        }
+      }
+
+      // Direct RPC fallback with high priority fee
+      const signature = await wallet.connection.sendRawTransaction(raw, {
+        skipPreflight: true,
+        maxRetries: 2,
+      });
+
+      const latestBlockhash = await wallet.connection.getLatestBlockhash('confirmed');
+      const confirmation = await wallet.connection.confirmTransaction(
+        {
+          signature,
+          blockhash: latestBlockhash.blockhash,
+          lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+        },
+        'confirmed',
+      );
+
+      if (confirmation.value.err) {
+        throw new Error(`Transaction on-chain revert: ${JSON.stringify(confirmation.value.err)}`);
+      }
+
+      return { success: true, signature, method: 'rpc', attempt };
+    } catch (err) {
+      lastError = err.message;
+      if (attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 700));
       }
     }
-
-    // Direct RPC with priority fee
-    const signature = await wallet.connection.sendRawTransaction(raw, {
-      skipPreflight: true,
-      maxRetries: 3,
-    });
-
-    const latestBlockhash = await wallet.connection.getLatestBlockhash('confirmed');
-    const confirmation = await wallet.connection.confirmTransaction({
-      signature,
-      blockhash: latestBlockhash.blockhash,
-      lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
-    }, 'confirmed');
-
-    if (confirmation.value.err) {
-      return { success: false, signature, error: `Transaction on-chain error: ${JSON.stringify(confirmation.value.err)}` };
-    }
-
-    return { success: true, signature, method: 'rpc' };
-  } catch (err) {
-    return { success: false, error: err.message };
   }
+
+  return { success: false, error: lastError ?? 'Swap confirmation timed out across all attempts' };
 }
 
 /**

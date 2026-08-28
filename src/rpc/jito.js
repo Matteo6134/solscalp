@@ -97,13 +97,45 @@ export async function getOptimalJitoTipLamports({ speed = 'high', now = Date.now
  * Pick a random Jito tip account for inclusion in bundle.
  * @returns {string} public key string
  */
+/**
+ * Calculate escalated tip in lamports for retry attempts to guarantee inclusion during congestion.
+ * @param {object} p
+ * @param {number} p.attempt Attempt index (1, 2, 3...)
+ * @param {'low'|'medium'|'high'|'ultra'} [p.baseSpeed='high']
+ * @returns {Promise<number>} lamports
+ */
+export async function getEscalatedTipLamports({ attempt = 1, baseSpeed = 'high' } = {}) {
+  const floor = await fetchJitoTipFloor();
+  let baseSol = floor.landed_tips_75th_percentile ?? 0.00005;
+
+  if (attempt === 1) {
+    if (baseSpeed === 'ultra') baseSol = floor.landed_tips_95th_percentile;
+    else if (baseSpeed === 'medium') baseSol = floor.landed_tips_50th_percentile;
+    else if (baseSpeed === 'low') baseSol = floor.landed_tips_25th_percentile;
+  } else if (attempt === 2) {
+    // Attempt 2: Escalate to 95th percentile or 1.8x base
+    baseSol = Math.max(floor.landed_tips_95th_percentile ?? 0.0002, baseSol * 1.8);
+  } else {
+    // Attempt 3+: Emergency exit tier: 2.5x of 95th percentile
+    baseSol = Math.max((floor.landed_tips_95th_percentile ?? 0.0002) * 2.5, baseSol * 2.5);
+  }
+
+  const lamports = Math.round(baseSol * LAMPORTS_PER_SOL);
+  // Cap at 0.015 SOL max tip to prevent extreme overspending
+  return Math.min(15_000_000, Math.max(5_000, lamports));
+}
+
+/**
+ * Pick a random Jito tip account for inclusion in bundle.
+ * @returns {string} public key string
+ */
 export function getRandomTipAccount() {
   const idx = Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length);
   return JITO_TIP_ACCOUNTS[idx];
 }
 
 /**
- * Submit a serialized transaction bundle directly to Jito Block Engine.
+ * Submit a serialized transaction bundle directly to a specific Jito Block Engine.
  * @param {string[]} serializedBase58Txs
  * @param {string} [endpoint]
  * @returns {Promise<string>} bundle ID
@@ -120,11 +152,61 @@ export async function sendJitoBundle(serializedBase58Txs, endpoint = JITO_BLOCK_
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(5_000),
+    signal: AbortSignal.timeout(4_000),
   });
 
   if (!res.ok) throw new Error(`Jito bundle submission failed with HTTP ${res.status}`);
   const json = await res.json();
   if (json.error) throw new Error(`Jito RPC Error: ${json.error.message ?? JSON.stringify(json.error)}`);
   return json.result;
+}
+
+/**
+ * Broadcasts a bundle concurrently across all global Jito block engines (Frankfurt, NY, Amsterdam, Tokyo)
+ * to eliminate regional network routing drops.
+ * @param {string[]} serializedBase58Txs
+ * @returns {Promise<{ bundleId: string, engine: string }>}
+ */
+export async function broadcastJitoBundle(serializedBase58Txs) {
+  const calls = JITO_BLOCK_ENGINES.map(async (engine) => {
+    const bundleId = await sendJitoBundle(serializedBase58Txs, engine);
+    return { bundleId, engine };
+  });
+
+  // Return as soon as the fastest regional block engine accepts the bundle
+  return await Promise.any(calls);
+}
+
+/**
+ * Query bundle inclusion status from Jito.
+ * @param {string} bundleId
+ * @returns {Promise<{ landed: boolean, status: string }>}
+ */
+export async function checkBundleStatus(bundleId) {
+  const payload = {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'getInflightBundleStatuses',
+    params: [[bundleId]],
+  };
+
+  try {
+    const res = await fetch(JITO_BLOCK_ENGINES[0], {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(3_000),
+    });
+    if (!res.ok) return { landed: false, status: 'unknown' };
+    const json = await res.json();
+    const result = json?.result?.value?.[0];
+    if (!result) return { landed: false, status: 'pending' };
+    return {
+      landed: result.status === 'Landed',
+      status: result.status,
+      landedSlot: result.landed_slot,
+    };
+  } catch {
+    return { landed: false, status: 'error' };
+  }
 }
