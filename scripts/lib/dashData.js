@@ -50,7 +50,7 @@ export async function buildDashData({ dir = RECORDER.dir, journalDir = JOURNAL.d
     try {
       const raw = await read(join(dir, file), 'utf8');
       const allLines = raw.split('\n').filter(Boolean);
-      lines.push(...allLines.slice(-400));
+      lines.push(...allLines);
     } catch {
       /* a file that vanished mid-read must not fail the whole screen */
     }
