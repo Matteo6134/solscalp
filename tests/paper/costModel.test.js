@@ -180,7 +180,7 @@ describe('breakEvenMovePct', () => {
     // never tens of percent. Bounds are deliberately wider (1%-6%) than the
     // 2-4% documented on COSTS so plausible quote variation does not break the
     // suite, while an arithmetic slip of 10x in either direction does.
-    expect(RISK.positionSizeUsd).toBe(40);
+    expect(RISK.positionSizeUsd).toBe(100);
     for (const impact of [0, 0.001, 0.004, 0.01]) {
       const move = breakEvenMovePct(estimate(impact));
       expect(move, `impact ${impact}`).toBeGreaterThan(1);

@@ -49,6 +49,7 @@ import { buildDashData } from './lib/dashData.js';
 import { getTradingMode, MODES as TRADE_MODES } from '../src/trade/modeManager.js';
 import { loadWallet, getWalletBalance } from '../src/trade/wallet.js';
 import { executeBuyOrder, executeSellOrder } from '../src/trade/executor.js';
+import { runAutoTrainCycle } from '../src/ml/autoTrainer.js';
 import { isRecorderHealthy, latestSnapshot } from '../src/evidence/tail.js';
 import { createNotifier } from '../src/notify/telegram.js';
 import {
@@ -299,7 +300,25 @@ export async function main(argv, injected = {}) {
     }
   })();
 
+  let lastMlTrainAt = 0;
+  const ML_TRAIN_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+
   while (running) {
+    const nowMs = deps.now();
+    if (nowMs - lastMlTrainAt >= ML_TRAIN_INTERVAL_MS) {
+      lastMlTrainAt = nowMs;
+      runAutoTrainCycle()
+        .then((res) => {
+          if (res.trained) {
+            say(
+              `[mlops] continuous online SGD update completed: accuracy ${res.accuracy}%, ` +
+                `${res.samplesCount} samples, ${res.updates} steps. Saved to data/ml_weights.json`,
+            );
+          }
+        })
+        .catch(() => {});
+    }
+
     try {
       await cycle({ state, notifier, deps, universe, paperEnabled, limit, fromRecording, paperDir });
     } catch (err) {

@@ -15,6 +15,7 @@
 
 import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { COSTS, SAFETY } from '../config.js';
+import { calculateConstantProductImpact } from './ammMath.js';
 import {
   assertFiniteNumber,
   assertNonNegativeNumber,
@@ -157,24 +158,41 @@ function readSlippageTolerancePct(quote) {
  * @param {Quote} [p.sellQuote]      live sell quote; required when COSTS.useLiveQuoteForSlippage
  * @returns {CostBreakdown} frozen breakdown
  */
-export function estimateRoundTripCost({ positionSizeUsd, solPriceUsd, priorityFeeLamports, buyQuote, sellQuote }) {
+export function estimateRoundTripCost({
+  positionSizeUsd,
+  solPriceUsd,
+  priorityFeeLamports,
+  buyQuote,
+  sellQuote,
+  liquidityUsd,
+}) {
   assertPositiveNumber(positionSizeUsd, 'positionSizeUsd');
   assertPositiveNumber(solPriceUsd, 'solPriceUsd');
 
   const useLiveQuotes = COSTS.useLiveQuoteForSlippage === true;
-  const buySlippagePct = useLiveQuotes
-    ? readPriceImpactPct(buyQuote, 'buyQuote')
-    : bpsToPct(SAFETY.layer1.quoteSlippageBps);
-  const sellSlippagePct = useLiveQuotes
-    ? readPriceImpactPct(sellQuote, 'sellQuote')
-    : bpsToPct(SAFETY.layer1.quoteSlippageBps);
-  const slippageSource = useLiveQuotes
-    ? 'live-quote:priceImpactPct'
-    : 'config:SAFETY.layer1.quoteSlippageBps';
+  let buySlippagePct;
+  let sellSlippagePct;
+  let slippageSource;
 
-  const priorityLamports = typeof priorityFeeLamports === 'number' && priorityFeeLamports > 0
-    ? priorityFeeLamports
-    : COSTS.priorityFeeLamports;
+  if (useLiveQuotes) {
+    buySlippagePct = readPriceImpactPct(buyQuote, 'buyQuote');
+    sellSlippagePct = readPriceImpactPct(sellQuote, 'sellQuote');
+    slippageSource = 'live-quote:priceImpactPct';
+  } else if (typeof liquidityUsd === 'number' && liquidityUsd > 0) {
+    const amm = calculateConstantProductImpact({ tradeSizeUsd: positionSizeUsd, liquidityUsd });
+    buySlippagePct = amm.buyImpactPct;
+    sellSlippagePct = amm.sellImpactPct;
+    slippageSource = 'constant-product-amm:x*y=k';
+  } else {
+    buySlippagePct = bpsToPct(SAFETY.layer1.quoteSlippageBps);
+    sellSlippagePct = bpsToPct(SAFETY.layer1.quoteSlippageBps);
+    slippageSource = 'config:SAFETY.layer1.quoteSlippageBps';
+  }
+
+  const priorityLamports =
+    typeof priorityFeeLamports === 'number' && priorityFeeLamports > 0
+      ? priorityFeeLamports
+      : COSTS.priorityFeeLamports;
 
   // --- lamport-denominated, size-independent ---
   const baseFeeUsd = lamportsToUsd(
