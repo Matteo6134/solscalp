@@ -50,6 +50,7 @@ import { getTradingMode, MODES as TRADE_MODES } from '../src/trade/modeManager.j
 import { loadWallet, getWalletBalance } from '../src/trade/wallet.js';
 import { executeBuyOrder, executeSellOrder } from '../src/trade/executor.js';
 import { runAutoTrainCycle } from '../src/ml/autoTrainer.js';
+import { startMemoryGuard } from '../src/supervisor/memoryGuard.js';
 import { isRecorderHealthy, latestSnapshot } from '../src/evidence/tail.js';
 import { createNotifier } from '../src/notify/telegram.js';
 import {
@@ -186,6 +187,8 @@ export async function main(argv, injected = {}) {
     out(`unknown --feed "${feed}"`);
     return EXIT.ERROR;
   }
+
+  startMemoryGuard({ processName: 'bot', maxHeapMb: 1200 });
 
   const deps = {
     now: injected.now ?? Date.now,

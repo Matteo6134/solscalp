@@ -3,6 +3,9 @@ import { Connection, PublicKey } from '@solana/web3.js';
 import fs from 'fs';
 import path from 'path';
 import { getBestPairs } from '../src/data/dexscreener.js';
+import { startMemoryGuard } from '../src/supervisor/memoryGuard.js';
+
+startMemoryGuard({ processName: 'radar', maxHeapMb: 1000 });
 
 const out = (msg) => {
   const ts = new Date().toISOString();

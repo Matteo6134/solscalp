@@ -68,6 +68,7 @@ import { EMPTY, buildDashData } from './lib/dashData.js';
 import { EXIT, intFlag, isMain, parseArgs, runMain } from './lib/cli.js';
 import { getTradingMode, setTradingMode, MODES } from '../src/trade/modeManager.js';
 import { loadWallet, getWalletBalance } from '../src/trade/wallet.js';
+import { startMemoryGuard } from '../src/supervisor/memoryGuard.js';
 
 const MS_PER_SECOND = 1_000;
 const VIEWS = Object.freeze(['live', 'positions', 'history', 'evidence', 'reentry']);
@@ -2239,6 +2240,8 @@ export async function main(argv, deps = {}) {
     out(USAGE);
     return EXIT.OK;
   }
+
+  startMemoryGuard({ processName: 'dash', maxHeapMb: 1200 });
 
   const dir = typeof flags.dir === 'string' ? flags.dir : RECORDER.dir;
   const journalDir = typeof flags['paper-dir'] === 'string' ? flags['paper-dir'] : JOURNAL.dir;

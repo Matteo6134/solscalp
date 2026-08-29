@@ -20,6 +20,7 @@
     "label": "node scripts/label.js",
     "watchlist": "node scripts/watchlist.js",
     "stop": "node scripts/stop.js",
+    "supervise": "node --max-old-space-size=4096 scripts/supervisor.js",
     "start": "powershell -NoProfile -ExecutionPolicy Bypass -File start.ps1"
   },
   "dependencies": {

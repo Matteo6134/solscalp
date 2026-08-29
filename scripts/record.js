@@ -33,8 +33,8 @@ import { loadEnv } from '../src/env.js';
 import { runLabellingPass } from '../src/evidence/labeller.js';
 import { decideEntry, readSignals, universeReasons } from '../src/paper/engine.js';
 import { emptyPortfolio } from '../src/paper/portfolio.js';
-import { costsFor, solPriceFrom } from './lib/liveCosts.js';
 import { runGate } from '../src/safety/index.js';
+import { startMemoryGuard } from '../src/supervisor/memoryGuard.js';
 import { EXIT, buildRpc, intFlag, isMain, parseArgs, runMain, say } from './lib/cli.js';
 
 const GATE_CONCURRENCY = 5;
@@ -193,6 +193,8 @@ export async function main(argv, deps = {}) {
     out(USAGE);
     return EXIT.OK;
   }
+
+  startMemoryGuard({ processName: 'record', maxHeapMb: 1400 });
 
   const useRadar = flags.radar === true;
   const defaultInterval = useRadar ? 5 : RECORDER.snapshotIntervalSeconds;
