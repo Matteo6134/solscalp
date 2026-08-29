@@ -33,6 +33,7 @@ import { loadEnv } from '../src/env.js';
 import { runLabellingPass } from '../src/evidence/labeller.js';
 import { decideEntry, readSignals, universeReasons } from '../src/paper/engine.js';
 import { emptyPortfolio } from '../src/paper/portfolio.js';
+import { costsFor, solPriceFrom } from './lib/liveCosts.js';
 import { runGate } from '../src/safety/index.js';
 import { startMemoryGuard } from '../src/supervisor/memoryGuard.js';
 import { EXIT, buildRpc, intFlag, isMain, parseArgs, runMain, say } from './lib/cli.js';
