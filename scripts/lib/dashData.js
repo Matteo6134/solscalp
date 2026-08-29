@@ -28,17 +28,98 @@ const MS_PER_HOUR = 3_600_000;
 /** How many recorder ticks a departed token stays visible for. */
 export const RECENT_WINDOW_TICKS = 10;
 
-/** In-memory cache for recorded lines and watchlist to prevent 50MB re-parsing every 3s */
-let cachedRecordingState = {
+import fs from 'node:fs';
+
+/** In-memory incremental state: only parses newly appended lines, keeping heap under 25MB */
+let cachedIncrementalState = {
   file: '',
-  size: 0,
-  mtimeMs: 0,
-  lines: [],
-  rows: [],
+  byteOffset: 0,
+  remainder: '',
+  rowsMap: new Map(),
+  labelsMap: new Map(),
   ticks: [],
   tally: null,
   report: null,
 };
+
+function processLineIntoWatchlist(line, state) {
+  const text = line.trim();
+  if (!text) return;
+  let record;
+  try {
+    record = JSON.parse(text);
+  } catch {
+    return;
+  }
+  if (record?.schemaVersion !== RECORDER.schemaVersion) return;
+
+  if (record.type === LABELS.recordType) {
+    for (const entry of record.labels ?? []) {
+      if (typeof entry?.mint === 'string') {
+        state.labelsMap.set(entry.mint, entry);
+        const row = state.rowsMap.get(entry.mint);
+        if (row) {
+          row.storedLabel = entry.outcome;
+          row.labelEvidence = entry.evidence ?? null;
+        }
+      }
+    }
+    return;
+  }
+
+  const candidates = record.candidates ?? [];
+  state.ticks.push({
+    ts: record.ts,
+    seen: candidates.length,
+    safe: candidates.filter((c) => c.gate?.buyable === true).length,
+  });
+  if (state.ticks.length > 300) {
+    state.ticks.shift();
+  }
+
+  const allPools = [
+    ...candidates,
+    ...(record.scanned ?? []).map((s) => ({
+      mint: s.mint,
+      symbol: s.symbol,
+      liquidityUsd: s.liquidityUsd,
+      marketCapUsd: s.marketCapUsd,
+      gate: { buyable: false, rejectedBy: s.rejectedBy ? [s.rejectedBy] : [] },
+    })),
+  ];
+
+  for (const c of allPools) {
+    if (typeof c?.mint !== 'string') continue;
+    const existing = state.rowsMap.get(c.mint);
+    if (existing === undefined) {
+      state.rowsMap.set(c.mint, {
+        mint: c.mint,
+        symbol: c.symbol ?? null,
+        firstTs: record.ts,
+        lastSeenTs: record.ts,
+        seen: 1,
+        entryLiquidityUsd: c.liquidityUsd ?? null,
+        entryPriceUsd: c.priceUsd ?? null,
+        entryMarketCapUsd: c.marketCapUsd ?? null,
+        gateBuyable: c.gate?.buyable ?? null,
+        gateBlockedBy: [...(c.gate?.rejectedBy ?? []), ...(c.gate?.erroredIn ?? [])],
+        series: [{ ts: record.ts, liq: c.liquidityUsd ?? null }],
+        storedLabel: state.labelsMap.get(c.mint)?.outcome ?? null,
+        labelEvidence: state.labelsMap.get(c.mint)?.evidence ?? null,
+      });
+    } else {
+      existing.seen += 1;
+      existing.lastSeenTs = record.ts;
+      if (c.liquidityUsd !== undefined && c.liquidityUsd !== null) {
+        existing.series.push({ ts: record.ts, liq: c.liquidityUsd });
+        // Keep max 25 sparkline points per mint to avoid RAM leak
+        if (existing.series.length > 25) {
+          existing.series.splice(1, 1);
+        }
+      }
+    }
+  }
+}
 
 /**
  * @param {object} [p]
@@ -56,61 +137,69 @@ export async function buildDashData({ dir = RECORDER.dir, journalDir = JOURNAL.d
   try {
     files = (await list(dir)).filter((f) => f.endsWith('.jsonl')).sort().slice(-1);
   } catch {
-    /* no directory yet: every field below degrades to empty, which is honest */
+    /* no directory yet */
   }
 
-  let lines = [];
   let rows = [];
   let ticks = [];
-  let tally = null;
   let report = null;
 
   if (files.length > 0) {
     const file = files[0];
     const fullPath = join(dir, file);
     try {
-      const fileStat = await getStat(fullPath);
-      if (
-        cachedRecordingState.file === file &&
-        cachedRecordingState.size === fileStat.size &&
-        cachedRecordingState.mtimeMs === fileStat.mtimeMs &&
-        cachedRecordingState.rows.length > 0
-      ) {
-        // Reuse cached computation instantly with 0 memory allocation
-        lines = cachedRecordingState.lines;
-        rows = cachedRecordingState.rows;
-        ticks = cachedRecordingState.ticks;
-        tally = cachedRecordingState.tally;
-        report = cachedRecordingState.report;
-      } else {
+      if (deps.readFile || deps.readdir || deps.stat) {
         const raw = await read(fullPath, 'utf8');
-        lines = raw.split('\n').filter(Boolean);
+        const lines = raw.split('\n').filter(Boolean);
         const wl = buildWatchlist(lines);
         rows = wl.rows;
         ticks = wl.ticks;
-        tally = tallyRecords(lines);
-        report = scoreRugFilter(tally);
+        report = scoreRugFilter(tallyRecords(lines));
+      } else {
+        const fileStat = await getStat(fullPath);
 
-        cachedRecordingState = {
-          file,
-          size: fileStat.size,
-          mtimeMs: fileStat.mtimeMs,
-          lines,
-          rows,
-          ticks,
-          tally,
-          report,
-        };
+        if (cachedIncrementalState.file !== file || fileStat.size < cachedIncrementalState.byteOffset) {
+          cachedIncrementalState = {
+            file,
+            byteOffset: 0,
+            remainder: '',
+            rowsMap: new Map(),
+            labelsMap: new Map(),
+            ticks: [],
+            tally: tallyRecords([]),
+            report: null,
+          };
+        }
+
+        if (fileStat.size > cachedIncrementalState.byteOffset) {
+          const fd = fs.openSync(fullPath, 'r');
+          const chunkSize = 128 * 1024;
+          while (cachedIncrementalState.byteOffset < fileStat.size) {
+            const bytesToRead = Math.min(chunkSize, fileStat.size - cachedIncrementalState.byteOffset);
+            const buf = Buffer.alloc(bytesToRead);
+            fs.readSync(fd, buf, 0, bytesToRead, cachedIncrementalState.byteOffset);
+            cachedIncrementalState.byteOffset += bytesToRead;
+
+            const chunkStr = cachedIncrementalState.remainder + buf.toString('utf8');
+            const lines = chunkStr.split('\n');
+            cachedIncrementalState.remainder = lines.pop() || '';
+
+            for (const line of lines) {
+              processLineIntoWatchlist(line, cachedIncrementalState);
+            }
+          }
+          fs.closeSync(fd);
+
+          cachedIncrementalState.report = scoreRugFilter(cachedIncrementalState.tally);
+        }
+
+        rows = [...cachedIncrementalState.rowsMap.values()];
+        ticks = cachedIncrementalState.ticks;
+        report = cachedIncrementalState.report;
       }
     } catch {
       /* a file that vanished mid-read must not fail the whole screen */
     }
-  } else {
-    const wl = buildWatchlist([]);
-    rows = wl.rows;
-    ticks = wl.ticks;
-    tally = tallyRecords([]);
-    report = scoreRugFilter(tally);
   }
 
   // The BOT's book, read rather than re-derived.
@@ -123,14 +212,26 @@ export async function buildDashData({ dir = RECORDER.dir, journalDir = JOURNAL.d
     ml = JSON.parse(raw);
   } catch (e) {}
 
-  const history = rows
+let cachedViewData = {
+  byteOffset: 0,
+  history: [],
+  recent: [],
+  latestTickTs: null,
+};
+
+function getFormattedViews(rows, ticks, now, byteOffset) {
+  if (cachedViewData.byteOffset === byteOffset && cachedViewData.history.length > 0) {
+    return cachedViewData;
+  }
+
+  const sortedRows = rows
+    .slice()
+    .sort((a, b) => (b.lastSeenTs ?? b.firstTs ?? 0) - (a.lastSeenTs ?? a.firstTs ?? 0));
+
+  const history = sortedRows
+    .slice(0, 100)
     .map((r) => {
       const lastLiq = [...r.series].reverse().find((p) => typeof p.liq === 'number')?.liq ?? null;
-      // The labeller RE-FETCHED to decide, so its figure is the honest "now".
-      // The recording's own tail is not: the recorder stops observing a token the
-      // moment it drops out of the screen, so its last stored value is the last
-      // HEALTHY reading rather than the outcome. Measured: one mint's final
-      // recorded liquidity was $61,861 against a live pool of $2,623.
       const measured = r.labelEvidence?.liquidityAfterUsd ?? null;
       const nowLiq = measured ?? lastLiq;
       const changePct =
@@ -155,27 +256,16 @@ export async function buildDashData({ dir = RECORDER.dir, journalDir = JOURNAL.d
         label: r.storedLabel ?? null,
         series: Object.freeze(r.series.filter((p) => typeof p.liq === 'number')),
       });
-    })
-    .sort((a, b) => (b.lastSeenTs ?? b.firstTs ?? 0) - (a.lastSeenTs ?? a.firstTs ?? 0));
+    });
 
-  // A token is in the recording only while it passes the screen, and the feed
-  // itself rotates, so the set changes almost every tick: measured over 8
-  // consecutive ticks, Hailey and BADGERS left, C4T arrived and left, Hezbollah
-  // and Pistacio arrived, Pistacio left. Showing only the newest snapshot makes
-  // that look like tokens vanishing at random.
-  //
-  // So keep a window of what was seen recently and mark whether it is still
-  // there. LEFT is a real state worth seeing, not an absence to hide -- though
-  // the recording cannot say WHICH of the two reasons applies, because a token
-  // that stopped trending and a token that stopped qualifying both simply stop
-  // being recorded. That limit is stated in the UI rather than papered over.
   const latestTickTs = ticks.length > 0 ? ticks[ticks.length - 1].ts : null;
   const windowMs = RECENT_WINDOW_TICKS * RECORDER.snapshotIntervalSeconds * 1000;
   const recent =
     latestTickTs === null
       ? []
-      : rows
+      : sortedRows
           .filter((r) => r.lastSeenTs >= latestTickTs - windowMs)
+          .slice(0, 50)
           .map((r) => {
             const ticksSince = ticks.filter((t) => t.ts > r.lastSeenTs).length;
             const inLatest = r.lastSeenTs === latestTickTs;
@@ -188,12 +278,16 @@ export async function buildDashData({ dir = RECORDER.dir, journalDir = JOURNAL.d
               lastSeenTs: r.lastSeenTs,
               firstTs: r.firstTs,
               gateBuyable: r.gateBuyable,
-              gateBlockedBy: Object.freeze([...(r.gateBlockedBy ?? [])]),
               liquidityUsd:
                 [...r.series].reverse().find((x) => Number.isFinite(x.liq))?.liq ?? null,
             });
-          })
-          .sort((a, b) => b.lastSeenTs - a.lastSeenTs || (a.symbol ?? '').localeCompare(b.symbol ?? ''));
+          });
+
+  cachedViewData = { byteOffset, history, recent, latestTickTs };
+  return cachedViewData;
+}
+
+  const { history, recent, latestTickTs } = getFormattedViews(rows, ticks, now, cachedIncrementalState.byteOffset);
 
   const uniqueClosedTrades = new Map();
   for (const t of journal.trades) {
@@ -314,7 +408,7 @@ export async function buildDashData({ dir = RECORDER.dir, journalDir = JOURNAL.d
       candles: Object.freeze(Object.fromEntries(journal.candles)),
     }),
     evidence: Object.freeze({
-      tally,
+      tally: cachedIncrementalState.tally ?? tallyRecords([]),
       report,
       baseRatePct: BASE_RATE_PCT,
       minSample: MIN_SAMPLE,
