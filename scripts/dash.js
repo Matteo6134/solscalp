@@ -69,6 +69,7 @@ import { EXIT, intFlag, isMain, parseArgs, runMain } from './lib/cli.js';
 import { getTradingMode, setTradingMode, MODES } from '../src/trade/modeManager.js';
 import { loadWallet, getWalletBalance } from '../src/trade/wallet.js';
 import { startMemoryGuard } from '../src/supervisor/memoryGuard.js';
+import { ensureBackgroundDaemonsRunning } from '../src/supervisor/daemonManager.js';
 
 const MS_PER_SECOND = 1_000;
 const VIEWS = Object.freeze(['live', 'positions', 'history', 'evidence', 'reentry']);
@@ -2242,6 +2243,10 @@ export async function main(argv, deps = {}) {
   }
 
   startMemoryGuard({ processName: 'dash', maxHeapMb: 1200 });
+
+  if (flags.once !== true && flags['no-autostart'] !== true) {
+    ensureBackgroundDaemonsRunning();
+  }
 
   const dir = typeof flags.dir === 'string' ? flags.dir : RECORDER.dir;
   const journalDir = typeof flags['paper-dir'] === 'string' ? flags['paper-dir'] : JOURNAL.dir;
